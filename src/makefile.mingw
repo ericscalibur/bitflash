@@ -1,0 +1,44 @@
+# Bitflash -- build for MSYS2 UCRT64 (modern g++ + wxWidgets 3.2 + OpenSSL 3 + Berkeley DB 6)
+# Based on Satoshi Nakamoto's original 2009 makefile (MIT/X11)
+# Usage: (UCRT64 shell)  mingw32-make -f makefile.mingw
+
+CXX = g++
+WXCXXFLAGS := $(shell wx-config --cxxflags)
+WXLIBS     := $(shell wx-config --libs std,richtext,html)
+WXRCFLAGS  := $(filter -I%,$(shell wx-config --cxxflags)) $(filter -D%,$(shell wx-config --cxxflags))
+
+DEFS = -DWIN32 -D__WXMSW__ -D_WINDOWS -DNOPCH
+# Path to the project's built dependencies (libsecp256k1 with Schnorr, RandomX)
+DEPS = ../deps
+RANDOMX = ../RandomX
+CXXFLAGS = -std=gnu++14 -O2 -w -fpermissive -Wno-deprecated-declarations -pthread $(DEFS) -I$(DEPS)/include -I$(RANDOMX)/src $(WXCXXFLAGS)
+HEADERS = headers.h util.h main.h serialize.h uint256.h key.h bignum.h script.h db.h base58.h net.h irc.h nostr.h randomx_pow.h btfaddr.h btfchan.h btfrv.h btftunnel.h market.h uibase.h ui.h
+
+LIBS = \
+ -ldb_cxx \
+ -L$(DEPS)/lib -lsecp256k1 \
+ -L$(RANDOMX)/build -lrandomx \
+ -lsodium \
+ -lssl -lcrypto \
+ -lkernel32 -luser32 -lgdi32 -lcomdlg32 -lwinspool -lwinmm -lshell32 -lcomctl32 \
+ -lole32 -loleaut32 -luuid -lrpcrt4 -ladvapi32 -lws2_32 -lmswsock -lcrypt32 -pthread
+
+OBJS = obj/util.o obj/script.o obj/db.o obj/net.o obj/main.o obj/market.o \
+       obj/ui.o obj/uibase.o obj/sha.o obj/irc.o obj/nostr.o obj/randomx_pow.o obj/btfaddr.o obj/btfchan.o obj/btfrv.o obj/btftunnel.o obj/ui_res.o
+
+all: bitflash.exe
+
+obj/%.o: %.cpp $(HEADERS)
+	$(CXX) -c $(CXXFLAGS) -o $@ $<
+
+obj/sha.o: sha.cpp sha.h
+	$(CXX) -c $(CXXFLAGS) -O3 -o $@ $<
+
+obj/ui_res.o: ui.rc rc/bitcoin.ico rc/check.ico
+	windres $(DEFS) $(WXRCFLAGS) -o $@ -i $<
+
+bitflash.exe: $(OBJS)
+	$(CXX) $(CXXFLAGS) -mwindows -Wl,--subsystem,windows -o $@ $(OBJS) $(WXLIBS) $(LIBS)
+
+clean:
+	rm -f obj/*.o bitflash.exe

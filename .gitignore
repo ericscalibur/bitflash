@@ -1,0 +1,30 @@
+# Build output
+src/obj/
+*.o
+*.exe
+*.a
+bitflash-node
+src/bitflash-node
+
+# Runtime data / logs
+debug.log
+db.log
+*.dat
+wallet.dat
+nostr.key
+btf_enc.key
+
+# Third-party build trees (rebuilt by the build scripts)
+RandomX/
+deps/
+secp256k1/
+secp256k1-build/
+
+# Distributable binaries (published as GitHub Releases, not committed)
+dist/
+*.tar.gz
+*.zip
+
+# Editor/OS cruft
+.DS_Store
+Thumbs.db
