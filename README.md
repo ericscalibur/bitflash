@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/logo.png" width="128" alt="Bitflash"/>
+<img src="docs/social.png" width="820" alt="Bitflash — Satoshi's Bitcoin reborn, mined with your CPU"/>
 
 # Bitflash ⚡ &nbsp;`BTF`
 
