@@ -235,8 +235,6 @@ systemctl daemon-reload && systemctl enable --now bitflash-node
 - [x] Fair-launch, stable-parameter relaunch
 - [x] Redundant relays across regions with automatic failover
 - [x] Automatic relay discovery over Nostr (self-announcing volunteer relays)
-- [ ] Optional direct IPv6 transport (opt-in, for public backbone nodes)
-- [ ] One-click installers
 
 ---
 
