@@ -138,15 +138,31 @@ source, then the `bitflash-node` binary. Debian/Ubuntu.
 Built with **MSYS2 UCRT64** (g++ 16, wxWidgets 3.2, OpenSSL 3, Berkeley DB). See
 [`build.sh`](build.sh) and `src/makefile.mingw`.
 
-### Run a rendezvous relay (optional, help the network)
+### 🛰️ Become a relay volunteer
 
-Have a box with a public IP? Run a relay in one command and strengthen the network:
+Relays are the meeting points that let nodes behind CGNAT find each other. More
+relays, spread across more places, make the network **faster** and **harder to
+knock offline**. If you have a VPS or box with a public IP, you can run one and
+directly strengthen Bitflash:
 
+**1. Run the relay — one command:**
 ```bash
 sudo bash relay/install-bitflash-relay.sh 8434
 ```
+It builds a tiny, dependency-free daemon, applies basic anti-flood firewall
+rules, and installs it as a `systemd` service (auto-restarts, survives reboot).
 
-It builds a tiny, dependency-free daemon and installs it as a systemd service.
+**2. Open TCP port `8434`** in your firewall / cloud panel.
+
+**3. Get it into the network.** Send your relay's `IP:8434` by
+[opening an issue](../../issues) (or a pull request adding it to the seed list
+in `src/nostr.cpp`). A maintainer reviews it and includes it in the **seed list**
+of the next release — then every node starts using it automatically, with
+failover if any relay goes down.
+
+> 🔒 A relay **never sees your traffic** — it only forwards end-to-end-encrypted
+> bytes and pairs peers by their `.btf` key. It holds no keys and reads nothing.
+> A 1 GB VPS is plenty, and every relay you add makes the whole network tougher.
 
 <details>
 <summary>Run the Linux node 24/7 (systemd)</summary>
@@ -197,8 +213,9 @@ systemctl daemon-reload && systemctl enable --now bitflash-node
 - [x] Automatic peer discovery — zero config
 - [x] Headless Linux node/miner
 - [x] Fair-launch, stable-parameter relaunch
+- [x] Redundant relays across regions with automatic failover
+- [ ] Automatic relay discovery over Nostr (self-announcing volunteer relays)
 - [ ] Optional direct IPv6 transport (opt-in, for public backbone nodes)
-- [ ] Redundant relays & bootstrap hardening
 - [ ] One-click installers
 
 ---
