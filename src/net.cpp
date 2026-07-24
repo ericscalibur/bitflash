@@ -442,18 +442,27 @@ void ThreadBtfAccept(void* parg)
         Sleep(5000);
     }
     size_t iRelay = 0;
+    bool fPicked = false;
     loop
     {
         if (fShutdown)
             return;
-        if (vBtfMeetingRelays.empty())
+        // Curated seeds + relays discovered from Nostr announcements.
+        vector<string> relays = BtfAllRelays();
+        if (relays.empty())
         {
             Sleep(10000); // no meeting relay configured
             continue;
         }
+        // Random start spreads nodes across all relays (incl. volunteer ones).
+        if (!fPicked)
+        {
+            iRelay = (size_t)GetRand(relays.size());
+            fPicked = true;
+        }
         // Stick to the current relay while it works; on failure, fail over to
-        // the next seed so a DDoS'd/blocked relay IP can't keep us offline.
-        string strMeeting = vBtfMeetingRelays[iRelay % vBtfMeetingRelays.size()];
+        // the next one so a DDoS'd/blocked relay IP can't keep us offline.
+        string strMeeting = relays[iRelay % relays.size()];
         size_t colon = strMeeting.rfind(':');
         if (colon == string::npos)
         {

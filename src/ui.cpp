@@ -2974,6 +2974,10 @@ bool CMyApp::OnInit2()
     if (mapArgs.count("/rvrelay"))
         vBtfMeetingRelays = { mapArgs["/rvrelay"] };
 
+    // Announce a relay you run so other nodes discover it automatically.
+    if (mapArgs.count("/announcerelay"))
+        strBtfAnnounceRelay = mapArgs["/announcerelay"];
+
     // Keep an anonymous outbound connection to a specific .btf peer.
     if (mapArgs.count("/connectbtf"))
         strBtfConnect = mapArgs["/connectbtf"];

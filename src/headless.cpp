@@ -80,6 +80,7 @@ int main(int argc, char* argv[])
             "  -datadir=<dir>        data directory (default ~/.bitflash)\n"
             "  -port=<n>             P2P listen port (default 8433)\n"
             "  -rvrelay=host:port    rendezvous meeting relay (has a seed default)\n"
+            "  -announcerelay=h:p    announce a relay you run so nodes discover it\n"
             "  -connectbtf=<a>.btf   keep a connection to a specific .btf peer\n"
             "  -solomine             mine without waiting for a peer (testing)\n"
             "  -debug                verbose logging\n",
@@ -96,6 +97,8 @@ int main(int argc, char* argv[])
         addrProxy = CAddress(mapArgs["/proxy"].c_str());
     if (mapArgs.count("/rvrelay"))
         vBtfMeetingRelays = { mapArgs["/rvrelay"] };
+    if (mapArgs.count("/announcerelay"))
+        strBtfAnnounceRelay = mapArgs["/announcerelay"];
     if (mapArgs.count("/connectbtf"))
         strBtfConnect = mapArgs["/connectbtf"];
     if (mapArgs.count("/debug"))

@@ -49,6 +49,24 @@ promise back.
 
 ---
 
+<div align="center">
+
+## 🔥 Don't let the network die — run a node
+
+A cryptocurrency is only as alive as the people running it. Every node that mines,
+relays, and stays online makes Bitflash **faster, freer, and impossible to shut down.**
+No companies. No servers to trust. No gatekeepers — just people, one CPU each.
+
+### Download it. Run it. Keep it alive.
+
+**[⬇️ Windows](../../releases/latest)** &nbsp;·&nbsp; **[🐧 Linux](#-linux-node--miner)** &nbsp;·&nbsp; **[🛰️ Run a relay](#-become-a-relay-volunteer--automatically)**
+
+*The network needs you online. Close this tab and it's one node weaker.*
+
+</div>
+
+---
+
 ## ✨ Features
 
 | | |
@@ -138,31 +156,33 @@ source, then the `bitflash-node` binary. Debian/Ubuntu.
 Built with **MSYS2 UCRT64** (g++ 16, wxWidgets 3.2, OpenSSL 3, Berkeley DB). See
 [`build.sh`](build.sh) and `src/makefile.mingw`.
 
-### 🛰️ Become a relay volunteer
+### 🛰️ Become a relay volunteer — automatically
 
 Relays are the meeting points that let nodes behind CGNAT find each other. More
-relays, spread across more places, make the network **faster** and **harder to
-knock offline**. If you have a VPS or box with a public IP, you can run one and
-directly strengthen Bitflash:
+relays, in more places, make the network **faster** and **harder to knock
+offline**. If you have a VPS with a public IP, you can add one — and **the whole
+network discovers it automatically. No approval, no gatekeeper, no waiting.**
 
 **1. Run the relay — one command:**
 ```bash
 sudo bash relay/install-bitflash-relay.sh 8434
 ```
-It builds a tiny, dependency-free daemon, applies basic anti-flood firewall
-rules, and installs it as a `systemd` service (auto-restarts, survives reboot).
+Builds a tiny, dependency-free daemon, applies anti-flood firewall rules, and
+installs it as a `systemd` service (auto-restarts, survives reboot).
 
 **2. Open TCP port `8434`** in your firewall / cloud panel.
 
-**3. Get it into the network.** Send your relay's `IP:8434` by
-[opening an issue](../../issues) (or a pull request adding it to the seed list
-in `src/nostr.cpp`). A maintainer reviews it and includes it in the **seed list**
-of the next release — then every node starts using it automatically, with
-failover if any relay goes down.
+**3. Announce it** by running a node that advertises your relay:
+```bash
+./bitflash-node -gen -announcerelay=YOUR_PUBLIC_IP:8434
+```
+That node publishes your relay over Nostr; every other node discovers it within
+a minute and adds it to its failover list. **Done — you're part of the backbone.**
 
-> 🔒 A relay **never sees your traffic** — it only forwards end-to-end-encrypted
-> bytes and pairs peers by their `.btf` key. It holds no keys and reads nothing.
-> A 1 GB VPS is plenty, and every relay you add makes the whole network tougher.
+> 🔒 A relay is **trustless** — it only forwards end-to-end-encrypted bytes and
+> pairs peers by their `.btf` key. It **cannot read, tamper with, or MITM** your
+> traffic; a malicious relay can at most refuse to forward, and nodes simply fail
+> over. That's exactly why anyone can run one safely. A 1 GB VPS is plenty.
 
 <details>
 <summary>Run the Linux node 24/7 (systemd)</summary>
@@ -214,7 +234,7 @@ systemctl daemon-reload && systemctl enable --now bitflash-node
 - [x] Headless Linux node/miner
 - [x] Fair-launch, stable-parameter relaunch
 - [x] Redundant relays across regions with automatic failover
-- [ ] Automatic relay discovery over Nostr (self-announcing volunteer relays)
+- [x] Automatic relay discovery over Nostr (self-announcing volunteer relays)
 - [ ] Optional direct IPv6 transport (opt-in, for public backbone nodes)
 - [ ] One-click installers
 

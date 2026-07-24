@@ -32,6 +32,12 @@ std::string BtfActiveRelay();
 // Record the relay this node just registered its service at (thread-safe).
 void BtfSetActiveRelay(const std::string& relay);
 
+// If set (via /announcerelay=host:port), this node announces that relay on
+// Nostr so other nodes discover it automatically -- no manual seed-list edit.
+extern std::string strBtfAnnounceRelay;
+// Every relay to try: curated seeds + relays discovered from Nostr announcements.
+std::vector<std::string> BtfAllRelays();
+
 // Copy this node's .btf identity (lazily loading or generating it): the x-only
 // pubkey (= the .btf address) and the x25519 secret for the end-to-end channel.
 bool BtfGetIdentity(unsigned char pubkey[32], unsigned char enc_sk[32]);

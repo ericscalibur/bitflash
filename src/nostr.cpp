@@ -31,6 +31,13 @@ static const int   BTF_DESC_KIND = 38501;
 // the abandoned test .btf descriptors lingering on the relays become invisible.
 static const char* BTF_DESC_DTAG = "btf-descriptor-2";
 
+// Relay auto-discovery: a relay operator announces their relay as an addressable
+// event (kind 38502) so every node learns it automatically -- no manual
+// seed-list edit, no maintainer approval. Volunteer relays just work.
+static const int    BTF_RELAY_KIND = 38502;
+static const char*  BTF_RELAY_DTAG = "btf-relay-2";
+static const size_t BTF_MAX_DISCOVERED_RELAYS = 50; // anti-spam cap
+
 // Nostr network/scope for Bitflash. Events are replaceable (NIP-78).
 static const int   NOSTR_KIND   = 30078;
 static const char* NOSTR_DTAG   = "bitflash-mainnet-2";
@@ -80,6 +87,48 @@ void BtfSetActiveRelay(const string& relay)
 {
     CRITICAL_BLOCK(cs_activeRelay)
         strBtfActiveRelay = relay;
+}
+
+// A relay this node advertises on Nostr for others to discover (/announcerelay).
+string strBtfAnnounceRelay;
+// Relays learned from other operators' Nostr announcements.
+static set<string> g_discoveredRelays;
+static CCriticalSection cs_discoveredRelays;
+
+// Basic sanity: "host:port" with a numeric 1..65535 port and a plausible host.
+static bool LooksLikeRelay(const string& r)
+{
+    size_t colon = r.rfind(':');
+    if (colon == string::npos || colon == 0 || colon + 1 >= r.size())
+        return false;
+    if (r.size() > 100)
+        return false;
+    for (size_t i = colon + 1; i < r.size(); i++)
+        if (!isdigit((unsigned char)r[i]))
+            return false;
+    int port = atoi(r.c_str() + colon + 1);
+    if (port <= 0 || port > 65535)
+        return false;
+    // host: allow letters, digits, dot, dash, colon (IPv6 not supported yet)
+    for (size_t i = 0; i < colon; i++)
+    {
+        char c = r[i];
+        if (!(isalnum((unsigned char)c) || c == '.' || c == '-'))
+            return false;
+    }
+    return true;
+}
+
+// Every relay to try: curated seeds first (reliable bootstrap), then the ones
+// discovered from Nostr announcements (volunteer relays).
+vector<string> BtfAllRelays()
+{
+    vector<string> all = vBtfMeetingRelays;
+    CRITICAL_BLOCK(cs_discoveredRelays)
+        foreach(const string& r, g_discoveredRelays)
+            if (find(all.begin(), all.end(), r) == all.end())
+                all.push_back(r);
+    return all;
 }
 
 
@@ -560,6 +609,21 @@ static void PublishDescriptor(CWebSocket& ws, CNostrKey& key)
     }
 }
 
+// Announce our relay (from /announcerelay=host:port) so every node discovers it
+// automatically -- volunteer relays join the network with no maintainer step.
+static void PublishRelayAnnouncement(CWebSocket& ws, CNostrKey& key)
+{
+    if (strBtfAnnounceRelay.empty())
+        return;
+    json tags = json::array({ json::array({ "d", BTF_RELAY_DTAG }) });
+    json ev;
+    if (BuildSignedEvent(key, BTF_RELAY_KIND, tags, strBtfAnnounceRelay, ev))
+    {
+        json pub = json::array({ "EVENT", ev });
+        ws.SendText(pub.dump());
+    }
+}
+
 // Resolve a `.btf` address via a relay: fetch the descriptor published by that
 // address's key and verify it self-certifies under the decoded pubkey.
 static bool ResolveDescriptor(CWebSocket& ws, void* ctx, const string& btfAddr,
@@ -654,6 +718,9 @@ static bool SeedFromRelay(CNostrKey& key, const string& relay)
     // Publish our self-certifying .btf descriptor (rendezvous discovery)
     PublishDescriptor(ws, key);
 
+    // If we run a relay, announce it so others discover it automatically
+    PublishRelayAnnouncement(ws, key);
+
     // Subscribe to receive the announcements of other nodes
     json filter = json::object();
     filter["kinds"] = json::array({ NOSTR_KIND });
@@ -730,6 +797,49 @@ static bool SeedFromRelay(CNostrKey& key, const string& relay)
                     if (fNew)
                         printf("Nostr: discovered .btf peer %s\n", peerAddr.c_str());
                     if (++nPeers > 500) break;
+                }
+                else if (type == "EOSE")
+                    break;
+            }
+        }
+    }
+
+    // Discover volunteer relays announced by other operators (kind 38502). Nodes
+    // add these to their failover list automatically, so anyone can strengthen
+    // the network without a maintainer editing the seed list. Bad/dead relays
+    // just fail to pair and get skipped -- and a relay is trustless anyway (it
+    // only forwards echan ciphertext and can't read or MITM the traffic).
+    ws.SendText(json::array({ "CLOSE", "btf-disc" }).dump());
+    {
+        json rfilter = json::object();
+        rfilter["kinds"] = json::array({ BTF_RELAY_KIND });
+        rfilter["#d"]    = json::array({ BTF_RELAY_DTAG });
+        rfilter["limit"] = 200;
+        json rreq = json::array({ "REQ", "btf-relays", rfilter });
+        if (ws.SendText(rreq.dump()))
+        {
+            for (;;)
+            {
+                string msg;
+                if (!ws.RecvText(msg))
+                    break;
+                json j;
+                try { j = json::parse(msg); } catch (...) { continue; }
+                if (!j.is_array() || j.empty()) continue;
+                string type = j[0].get<string>();
+                if (type == "EVENT" && j.size() >= 3)
+                {
+                    const json& ev = j[2];
+                    if (!ev.contains("content") || !ev.contains("kind")) continue;
+                    if (ev["kind"].get<int>() != BTF_RELAY_KIND) continue;
+                    string r = ev["content"].get<string>();
+                    if (!LooksLikeRelay(r)) continue;
+                    bool fNew = false;
+                    CRITICAL_BLOCK(cs_discoveredRelays)
+                        if (g_discoveredRelays.size() < BTF_MAX_DISCOVERED_RELAYS)
+                            fNew = g_discoveredRelays.insert(r).second;
+                    if (fNew)
+                        printf("Nostr: discovered relay %s\n", r.c_str());
                 }
                 else if (type == "EOSE")
                     break;
