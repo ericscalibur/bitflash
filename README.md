@@ -24,6 +24,12 @@ that hides your IP and punches through CGNAT, and a **fair launch** with no prem
 
 **[⬇️ Download for Windows](../../releases/latest)** &nbsp;·&nbsp; **[🐧 Build for Linux](#-linux-node--miner)** &nbsp;·&nbsp; **[🧠 How it works](#-how-it-works)**
 
+<br/>
+
+<img src="docs/wallet.png" width="640" alt="Bitflash wallet mining with RandomX"/>
+
+<sub>The Bitflash wallet — mining with RandomX, connected to the network, coins accruing. No pools, no ASICs, no gatekeepers.</sub>
+
 </div>
 
 ---
@@ -130,6 +136,14 @@ flowchart LR
 The relay is dumb on purpose: it pairs peers by their `.btf` key and forwards bytes. The
 real connection is end-to-end encrypted (X25519 + XChaCha20-Poly1305) and authenticated
 to each peer's static key, so a malicious relay can't read or tamper — it can only refuse.
+
+<div align="center">
+
+<img src="docs/discovery.png" width="680" alt="Bitflash node connecting by .btf through the rendezvous and mining RandomX"/>
+
+<sub>A node tunneling to a peer by its <code>.btf</code> address through the rendezvous, and finding a RandomX proof of work — automatic, no configuration, no IP exposed.</sub>
+
+</div>
 
 ### RandomX proof of work
 
