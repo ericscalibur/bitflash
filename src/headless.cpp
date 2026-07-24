@@ -95,7 +95,7 @@ int main(int argc, char* argv[])
     if (mapArgs.count("/proxy"))
         addrProxy = CAddress(mapArgs["/proxy"].c_str());
     if (mapArgs.count("/rvrelay"))
-        strBtfMeetingRelay = mapArgs["/rvrelay"];
+        vBtfMeetingRelays = { mapArgs["/rvrelay"] };
     if (mapArgs.count("/connectbtf"))
         strBtfConnect = mapArgs["/connectbtf"];
     if (mapArgs.count("/debug"))

@@ -295,6 +295,25 @@ echo ">> building bitflashd"
 g++ -std=gnu++14 -O2 -pthread bitflashd.cpp btfrv.cpp -o bitflashd
 echo ">> build OK: $DIR/bitflashd"
 
+# Basic anti-flood firewall rules (idempotent). These soak up single-source
+# connection floods; volumetric DDoS still needs provider-level protection.
+# Limits are generous so many users behind one CGNAT public IP aren't blocked.
+if command -v iptables >/dev/null 2>&1; then
+  echo ">> applying connection rate-limit on port $PORT"
+  # Cap concurrent connections per source IP (stops one IP hogging thousands)
+  iptables -C INPUT -p tcp --dport "$PORT" -m connlimit --connlimit-above 200 --connlimit-mask 32 -j REJECT --reject-with tcp-reset 2>/dev/null || \
+    iptables -A INPUT -p tcp --dport "$PORT" -m connlimit --connlimit-above 200 --connlimit-mask 32 -j REJECT --reject-with tcp-reset
+  # Cap NEW-connection rate per source IP (stops connection floods)
+  iptables -C INPUT -p tcp --dport "$PORT" -m conntrack --ctstate NEW -m hashlimit \
+      --hashlimit-name btfrelay --hashlimit-mode srcip --hashlimit-above 60/min --hashlimit-burst 100 -j DROP 2>/dev/null || \
+    iptables -A INPUT -p tcp --dport "$PORT" -m conntrack --ctstate NEW -m hashlimit \
+      --hashlimit-name btfrelay --hashlimit-mode srcip --hashlimit-above 60/min --hashlimit-burst 100 -j DROP
+  # Persist across reboots if the tooling is present
+  command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true
+else
+  echo ">> iptables not found; skipping rate-limit (host on a provider with anti-DDoS)"
+fi
+
 # systemd service so it survives reboots (skipped if systemd is absent)
 if command -v systemctl >/dev/null 2>&1 && [ -d /etc/systemd/system ]; then
   cat > /etc/systemd/system/bitflashd.service <<EOF

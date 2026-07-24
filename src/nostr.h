@@ -11,6 +11,7 @@
 #define BITFLASH_NOSTR_H
 
 #include <string>
+#include <vector>
 
 // Thread entry point (signature compatible with _beginthread)
 void ThreadNostrSeed(void* parg);
@@ -19,9 +20,17 @@ void ThreadNostrSeed(void* parg);
 extern const char* pszNostrRelays[];
 extern const int nNostrRelays;
 
-// Rendezvous meeting relay ("host:port") this node registers at and advertises
-// in its .btf descriptor. Overridable with /rvrelay=host:port.
-extern std::string strBtfMeetingRelay;
+// Rendezvous meeting relays ("host:port") this node can register its .btf
+// service at. It registers at the first reachable one and advertises that in
+// its descriptor; if the relay dies it fails over to another, so attacking a
+// single relay's IP can't take the network down. Overridable with /rvrelay.
+extern std::vector<std::string> vBtfMeetingRelays;
+// The relay this node is currently registered at (set by ThreadBtfAccept).
+extern std::string strBtfActiveRelay;
+// The active relay, or the first seed if none active yet ("" if the list is empty).
+std::string BtfActiveRelay();
+// Record the relay this node just registered its service at (thread-safe).
+void BtfSetActiveRelay(const std::string& relay);
 
 // Copy this node's .btf identity (lazily loading or generating it): the x-only
 // pubkey (= the .btf address) and the x25519 secret for the end-to-end channel.

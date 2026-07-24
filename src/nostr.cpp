@@ -55,7 +55,32 @@ const int nNostrRelays = ARRAYLEN(pszNostrRelays);
 
 // Rendezvous meeting relay this node registers at (ThreadBtfAccept in net.cpp)
 // and advertises in its .btf descriptor. Seed default; /rvrelay overrides.
-string strBtfMeetingRelay = "90.156.222.107:8434";
+// Seed rendezvous relays. More entries = more resilience: the node fails over
+// between them (see ThreadBtfAccept), so DDoSing one relay IP can't take the
+// network down. /rvrelay overrides this list with a single entry.
+vector<string> vBtfMeetingRelays = {
+    "92.246.128.180:8434",  // Sao Paulo, BR
+    "31.44.4.249:8434",     // New Jersey, US
+    "90.156.222.107:8434",  // Almaty, KZ
+};
+string strBtfActiveRelay;
+static CCriticalSection cs_activeRelay;
+
+string BtfActiveRelay()
+{
+    CRITICAL_BLOCK(cs_activeRelay)
+        if (!strBtfActiveRelay.empty())
+            return strBtfActiveRelay;
+    if (!vBtfMeetingRelays.empty())
+        return vBtfMeetingRelays[0];
+    return "";
+}
+
+void BtfSetActiveRelay(const string& relay)
+{
+    CRITICAL_BLOCK(cs_activeRelay)
+        strBtfActiveRelay = relay;
+}
 
 
 //
@@ -519,8 +544,9 @@ static void PublishDescriptor(CWebSocket& ws, CNostrKey& key)
 {
     // meeting_node is the rendezvous relay this node's hidden service
     // (ThreadBtfAccept in net.cpp) is registered at -- where clients dial us.
-    string meeting_node = strBtfMeetingRelay.empty() ? "rendezvous-pending"
-                                                     : strBtfMeetingRelay;
+    string meeting_node = BtfActiveRelay();
+    if (meeting_node.empty())
+        meeting_node = "rendezvous-pending";
     string desc = btf::SignDescriptor(key.ctx, key.seckey, key.EncPubHex(),
                                       meeting_node, (uint64_t)GetTime());
     if (desc.empty())

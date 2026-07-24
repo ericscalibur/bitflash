@@ -441,15 +441,24 @@ void ThreadBtfAccept(void* parg)
             return;
         Sleep(5000);
     }
+    size_t iRelay = 0;
     loop
     {
         if (fShutdown)
             return;
-        string strMeeting = strBtfMeetingRelay;
+        if (vBtfMeetingRelays.empty())
+        {
+            Sleep(10000); // no meeting relay configured
+            continue;
+        }
+        // Stick to the current relay while it works; on failure, fail over to
+        // the next seed so a DDoS'd/blocked relay IP can't keep us offline.
+        string strMeeting = vBtfMeetingRelays[iRelay % vBtfMeetingRelays.size()];
         size_t colon = strMeeting.rfind(':');
         if (colon == string::npos)
         {
-            Sleep(10000); // no meeting relay configured
+            iRelay++;
+            Sleep(2000);
             continue;
         }
         string strHost = strMeeting.substr(0, colon);
@@ -465,9 +474,13 @@ void ThreadBtfAccept(void* parg)
         }
         if (rv == btf::RV_INVALID)
         {
-            Sleep(10000); // relay unreachable; retry
+            iRelay++;       // this relay is down/attacked -> try the next one
+            Sleep(3000);
             continue;
         }
+        // Registered OK: advertise THIS relay in our descriptor so clients dial
+        // us here, and keep using it (iRelay unchanged) until it fails.
+        BtfSetActiveRelay(strMeeting);
         btf_socket_t hSocket = btf::BtfServiceWrap(rv, sk);
         if (hSocket == INVALID_SOCKET)
             continue;
@@ -1146,7 +1159,7 @@ bool StartNode(string& strError)
 
     // Anonymous inbound: this node's .btf hidden service, reachable through the
     // meeting relay without exposing our IP or needing a public port.
-    if (!strBtfMeetingRelay.empty())
+    if (!vBtfMeetingRelays.empty())
         if (_beginthread(ThreadBtfAccept, 0, NULL) == -1)
             printf("Error: _beginthread(ThreadBtfAccept) failed\n");
 

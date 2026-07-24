@@ -2969,10 +2969,10 @@ bool CMyApp::OnInit2()
     if (mapArgs.count("/proxy"))
         addrProxy = CAddress(mapArgs["/proxy"].c_str());
 
-    // Rendezvous meeting relay this node registers its .btf service at and
-    // advertises in its descriptor (default is the seed relay; empty disables).
+    // Rendezvous meeting relay override: replace the seed list with a single
+    // relay (default keeps the built-in seed list with failover).
     if (mapArgs.count("/rvrelay"))
-        strBtfMeetingRelay = mapArgs["/rvrelay"];
+        vBtfMeetingRelays = { mapArgs["/rvrelay"] };
 
     // Keep an anonymous outbound connection to a specific .btf peer.
     if (mapArgs.count("/connectbtf"))
