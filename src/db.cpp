@@ -539,7 +539,7 @@ bool CWalletDB::LoadWallet(vector<unsigned char>& vchDefaultKeyRet)
 
                 //// debug print
                 //printf("LoadWallet  %s\n", wtx.GetHash().ToString().c_str());
-                //printf(" %12I64d  %s  %s  %s\n",
+                //printf(" %12lld  %s  %s  %s\n",
                 //    wtx.vout[0].nValue,
                 //    DateTimeStr(wtx.nTime).c_str(),
                 //    wtx.hashBlock.ToString().substr(0,14).c_str(),
@@ -566,13 +566,21 @@ bool CWalletDB::LoadWallet(vector<unsigned char>& vchDefaultKeyRet)
                 if (strKey == "fGenerateBitcoins")  ssValue >> fGenerateBitcoins;
                 if (strKey == "nTransactionFee")    ssValue >> nTransactionFee;
                 if (strKey == "addrIncoming")       ssValue >> addrIncoming;
+                if (strKey == "nMineMode")          ssValue >> nMineMode;
+                if (strKey == "strParticipantPool") ssValue >> strParticipantPool;
+                if (strKey == "strPoolName")        ssValue >> strPoolName;
+                if (strKey == "strPoolDashboardUrl") ssValue >> strPoolDashboardUrl;
+                if (strKey == "dPoolFeePercent")    ssValue >> dPoolFeePercent;
             }
         }
     }
 
     printf("fGenerateBitcoins = %d\n", fGenerateBitcoins);
-    printf("nTransactionFee = %I64d\n", nTransactionFee);
+    printf("nTransactionFee = %lld\n", nTransactionFee);
     printf("addrIncoming = %s\n", addrIncoming.ToString().c_str());
+    printf("nMineMode = %d, strParticipantPool = %s\n", nMineMode, strParticipantPool.c_str());
+    printf("strPoolName = %s, dPoolFeePercent = %.2f\n", strPoolName.c_str(), dPoolFeePercent);
+    printf("strPoolDashboardUrl = %s\n", strPoolDashboardUrl.c_str());
 
     return true;
 }

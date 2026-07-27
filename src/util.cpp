@@ -200,10 +200,11 @@ void PrintException(std::exception* pex, const char* pszThread)
         snprintf(pszMessage, sizeof(pszMessage),
             "UNKNOWN EXCEPTION       \n%s in %s       \n", pszModule, pszThread);
     printf("\n\n************************\n%s", pszMessage);
-    if (wxTheApp)
-        wxMessageBox(pszMessage, "Error", wxOK | wxICON_ERROR);
-    throw;
-    //DebugBreak();
+    // Suppress the dialog and rethrow during shutdown — threads unwinding on
+    // exit cause spurious "UNKNOWN EXCEPTION" popups that aren't real errors.
+    // Show error in GUI via repaint signal — GUI polls g_errorMessage
+    if (!fShutdown)
+        throw;
 }
 
 
@@ -224,7 +225,7 @@ void ParseString(const string& str, char c, vector<string>& v)
 string FormatMoney(int64 n, bool fPlus)
 {
     n /= CENT;
-    string str = strprintf("%I64d.%02I64d", (n > 0 ? n : -n)/100, (n > 0 ? n : -n)%100);
+    string str = strprintf("%lld.%02lld", (n > 0 ? n : -n)/100, (n > 0 ? n : -n)%100);
     for (int i = 6; i < str.size(); i += 4)
         if (isdigit(str[str.size() - i - 1]))
             str.insert(str.size() - i, 1, ',');
@@ -373,7 +374,7 @@ void AddTimeData(unsigned int ip, int64 nTime)
     if (vTimeOffsets.empty())
         vTimeOffsets.push_back(0);
     vTimeOffsets.push_back(nOffsetSample);
-    printf("Added time data, samples %d, ip %08x, offset %+I64d (%+I64d minutes)\n", vTimeOffsets.size(), ip, vTimeOffsets.back(), vTimeOffsets.back()/60);
+    printf("Added time data, samples %d, ip %08x, offset %+lld (%+lld minutes)\n", vTimeOffsets.size(), ip, vTimeOffsets.back(), vTimeOffsets.back()/60);
     if (vTimeOffsets.size() >= 5 && vTimeOffsets.size() % 2 == 1)
     {
         sort(vTimeOffsets.begin(), vTimeOffsets.end());
@@ -387,7 +388,7 @@ void AddTimeData(unsigned int ip, int64 nTime)
             ///    to make sure it doesn't get changed again
         }
         foreach(int64 n, vTimeOffsets)
-            printf("%+I64d  ", n);
-        printf("|  nTimeOffset = %+I64d  (%+I64d minutes)\n", nTimeOffset, nTimeOffset/60);
+            printf("%+lld  ", n);
+        printf("|  nTimeOffset = %+lld  (%+lld minutes)\n", nTimeOffset, nTimeOffset/60);
     }
 }

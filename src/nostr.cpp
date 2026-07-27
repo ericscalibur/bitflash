@@ -38,18 +38,24 @@ static const int    BTF_RELAY_KIND = 38502;
 static const char*  BTF_RELAY_DTAG = "btf-relay-2";
 static const size_t BTF_MAX_DISCOVERED_RELAYS = 50; // anti-spam cap
 
-// Nostr network/scope for Bitflash. Events are replaceable (NIP-78).
-static const int   NOSTR_KIND   = 30078;
-static const char* NOSTR_DTAG   = "bitflash-mainnet-2";
+// Pool announcements carry the operator's .btf address, fee, and live stats.
+static const int   BTF_POOL_KIND = 38503;
+static const char* BTF_POOL_DTAG  = "btf-pool-2";
+static const int64 BTF_POOL_MAX_AGE = 3 * 60; // seconds
 
 // Anonymous auto-discovery: how many peers to keep connected via .btf rendezvous
 // before we stop dialing more, and how many new dials to attempt per cycle.
 static const unsigned int BTF_TARGET_CONN   = 8;
-static const int          BTF_DIALS_PER_PASS = 4;
+static const int          BTF_DIALS_PER_PASS = 12;  // try more peers per Nostr cycle
+
+// Nostr descriptor freshness cutoff: skip peers whose descriptor hasn't been
+// refreshed in this many seconds. Stale descriptors mean the node isn't running.
+static const int64 BTF_PEER_MAX_AGE = 3 * 60 * 60; // 3 hours
 
 // Other nodes' .btf addresses learned from their descriptors on the relays.
-static set<string> g_btfPeers;
-static CCriticalSection cs_btfPeers;
+// Maps address -> descriptor created_at timestamp (Unix seconds).
+static map<string, int64> g_btfPeers;
+static CCriticalSection   cs_btfPeers;
 
 // Public discovery relays. Tunable.
 const char* pszNostrRelays[] = {
@@ -94,6 +100,10 @@ string strBtfAnnounceRelay;
 // Relays learned from other operators' Nostr announcements.
 static set<string> g_discoveredRelays;
 static CCriticalSection cs_discoveredRelays;
+
+// Live pool announcements discovered from the relays.
+static map<string, BtfPoolAnnouncement> g_discoveredPools;
+static CCriticalSection cs_discoveredPools;
 
 // Basic sanity: "host:port" with a numeric 1..65535 port and a plausible host.
 static bool LooksLikeRelay(const string& r)
@@ -307,6 +317,27 @@ std::string BtfLocalAddress()
     return g_nostrKey.BtfAddress();
 }
 
+void BtfGetPoolAnnouncements(std::vector<BtfPoolAnnouncement>& out)
+{
+    out.clear();
+    int64 now = GetTime();
+    CRITICAL_BLOCK(cs_discoveredPools)
+    {
+        for (map<string, BtfPoolAnnouncement>::iterator it = g_discoveredPools.begin(); it != g_discoveredPools.end(); )
+        {
+            if (it->second.createdAt > 0 && now - it->second.createdAt > BTF_POOL_MAX_AGE)
+            {
+                it = g_discoveredPools.erase(it);
+                continue;
+            }
+            out.push_back(it->second);
+            ++it;
+        }
+    }
+    sort(out.begin(), out.end(), [](const BtfPoolAnnouncement& a, const BtfPoolAnnouncement& b) {
+        return a.createdAt > b.createdAt;
+    });
+}
 
 // Build and sign a Nostr event (NIP-01). Returns the event JSON.
 static bool BuildSignedEvent(CNostrKey& key, int kind, const json& tags,
@@ -567,25 +598,6 @@ private:
 };
 
 
-// Handle a received event: extract "ip:port" and register the address.
-static void HandlePeerEvent(const json& ev)
-{
-    if (!ev.contains("content")) return;
-    string content = ev["content"].get<string>();
-    // expected content: "ip:port"
-    CAddress addr(content.c_str());
-    if (addr.ip == 0 || addr.ip == INADDR_NONE)
-        return;
-    if (addr.ip == addrLocalHost.ip && addr.port == addrLocalHost.port)
-        return; // not ourselves (same ip:port)
-    // Peer received from the relay (before AddAddress's routability filter).
-    printf("Nostr: peer received from relay: %s\n", addr.ToStringIPPort().c_str());
-    CAddrDB addrdb;
-    if (AddAddress(addrdb, addr))
-        printf("Nostr: new peer added %s\n", addr.ToStringIPPort().c_str());
-}
-
-
 // Publish this node's self-certifying `.btf` descriptor: "reach me (this key)
 // via <meeting_node>, encrypting to my x25519 key <enc>". Signed by the node
 // key so only the address's owner can publish it (no hijacking).
@@ -621,6 +633,176 @@ static void PublishRelayAnnouncement(CWebSocket& ws, CNostrKey& key)
     {
         json pub = json::array({ "EVENT", ev });
         ws.SendText(pub.dump());
+    }
+}
+
+static bool PublishPoolAnnouncementOnRelay(CWebSocket& ws, CNostrKey& key,
+                                           const BtfPoolAnnouncement& ann)
+{
+    if (ann.btfAddress.empty() || ann.poolName.empty())
+        return false;
+
+    json content = json::object();
+    content["btf"] = ann.btfAddress;
+    content["name"] = ann.poolName;
+    if (!ann.dashboardUrl.empty())
+        content["dashboard_url"] = ann.dashboardUrl;
+    content["fee_pct"] = ann.feePercent;
+    content["miners"] = ann.connectedMiners;
+    content["blocks"] = ann.blocksFound;
+    content["hashrate"] = ann.hashRate;
+
+    json tags = json::array({
+        json::array({ "d", BTF_POOL_DTAG }),
+        json::array({ "t", BTF_POOL_DTAG })
+    });
+    json ev;
+    if (!BuildSignedEvent(key, BTF_POOL_KIND, tags, content.dump(), ev))
+        return false;
+    json pub = json::array({ "EVENT", ev });
+    return ws.SendText(pub.dump());
+}
+
+bool BtfPublishPoolAnnouncement(const BtfPoolAnnouncement& ann)
+{
+    if (!EnsureNostrKey())
+        return false;
+
+    bool fPublished = false;
+    for (int i = 0; i < nNostrRelays && !fShutdown; i++)
+    {
+        try
+        {
+            CWebSocket ws;
+            if (!ws.Connect(pszNostrRelays[i], 10))
+                continue;
+            if (PublishPoolAnnouncementOnRelay(ws, g_nostrKey, ann))
+                fPublished = true;
+        }
+        CATCH_PRINT_EXCEPTION("BtfPublishPoolAnnouncement")
+    }
+    return fPublished;
+}
+
+bool BtfQueryPoolAnnouncement(const std::string& poolBtfAddr, BtfPoolAnnouncement& out)
+{
+    unsigned char pk[32];
+    if (!btf::ParseAddress(poolBtfAddr, pk))
+        return false;
+
+    if (!EnsureNostrKey())
+        return false;
+
+    int64 bestCreatedAt = 0;
+    bool fFound = false;
+    for (int i = 0; i < nNostrRelays && !fShutdown; i++)
+    {
+        try
+        {
+            CWebSocket ws;
+            if (!ws.Connect(pszNostrRelays[i], 10))
+                continue;
+
+            json filter = json::object();
+            filter["authors"] = json::array({ HexEncode(pk, 32) });
+            filter["kinds"] = json::array({ BTF_POOL_KIND });
+            filter["#d"] = json::array({ BTF_POOL_DTAG });
+            filter["limit"] = 1;
+            json req = json::array({ "REQ", "btf-pool-query", filter });
+            if (!ws.SendText(req.dump()))
+                continue;
+
+            for (;;)
+            {
+                string msg;
+                if (!ws.RecvText(msg))
+                    break;
+                json j;
+                try { j = json::parse(msg); } catch (...) { continue; }
+                if (!j.is_array() || j.empty()) continue;
+                string type = j[0].get<string>();
+                if (type == "EVENT" && j.size() >= 3)
+                {
+                    const json& ev = j[2];
+                    if (!ev.contains("content") || !ev["content"].is_string())
+                        continue;
+                    BtfPoolAnnouncement ann;
+                    try
+                    {
+                        json content = json::parse(ev["content"].get<string>());
+                        if (content.contains("btf") && content["btf"].is_string())
+                            ann.btfAddress = content["btf"].get<string>();
+                        if (content.contains("name") && content["name"].is_string())
+                            ann.poolName = content["name"].get<string>();
+                        if (content.contains("dashboard_url") && content["dashboard_url"].is_string())
+                            ann.dashboardUrl = content["dashboard_url"].get<string>();
+                        ann.feePercent = content.value("fee_pct", content.value("fee", 0.0));
+                        ann.connectedMiners = content.value("miners", 0);
+                        ann.blocksFound = content.value("blocks", 0);
+                        ann.hashRate = content.value("hashrate", 0.0);
+                        ann.createdAt = ev.value("created_at", (int64)0);
+                    }
+                    catch (...)
+                    {
+                        continue;
+                    }
+                    if (ann.btfAddress == poolBtfAddr && ann.createdAt >= bestCreatedAt)
+                    {
+                        bestCreatedAt = ann.createdAt;
+                        out = ann;
+                        fFound = true;
+                    }
+                }
+                else if (type == "EOSE")
+                    break;
+            }
+        }
+        CATCH_PRINT_EXCEPTION("BtfQueryPoolAnnouncement")
+    }
+
+    return fFound;
+}
+
+static void HandlePoolAnnouncement(const json& ev)
+{
+    if (!ev.contains("content") || !ev["content"].is_string())
+        return;
+
+    BtfPoolAnnouncement ann;
+    try
+    {
+        json content = json::parse(ev["content"].get<string>());
+        if (content.contains("btf") && content["btf"].is_string())
+            ann.btfAddress = content["btf"].get<string>();
+        else if (content.contains("address") && content["address"].is_string())
+            ann.btfAddress = content["address"].get<string>();
+        if (content.contains("name") && content["name"].is_string())
+            ann.poolName = content["name"].get<string>();
+        else if (content.contains("pool_name") && content["pool_name"].is_string())
+            ann.poolName = content["pool_name"].get<string>();
+        if (content.contains("dashboard_url") && content["dashboard_url"].is_string())
+            ann.dashboardUrl = content["dashboard_url"].get<string>();
+        else if (content.contains("dashboard") && content["dashboard"].is_string())
+            ann.dashboardUrl = content["dashboard"].get<string>();
+        ann.feePercent = content.value("fee_pct", content.value("fee", 0.0));
+        ann.connectedMiners = content.value("miners", 0);
+        ann.blocksFound = content.value("blocks", 0);
+        ann.hashRate = content.value("hashrate", 0.0);
+        ann.createdAt = ev.value("created_at", (int64)0);
+    }
+    catch (...)
+    {
+        return;
+    }
+
+    if (ann.btfAddress.empty() || ann.poolName.empty())
+        return;
+
+    CRITICAL_BLOCK(cs_discoveredPools)
+    {
+        map<string, BtfPoolAnnouncement>::iterator it = g_discoveredPools.find(ann.btfAddress);
+        if (it == g_discoveredPools.end() || ann.createdAt >= it->second.createdAt)
+            g_discoveredPools[ann.btfAddress] = ann;
     }
 }
 
@@ -692,7 +874,7 @@ bool BtfResolve(const std::string& btfAddr, std::string& meetingHostPort,
 }
 
 
-// Connect to a relay: publish our address and collect the others'.
+// Connect to a relay: publish our .btf descriptor and collect relay data.
 static bool SeedFromRelay(CNostrKey& key, const string& relay)
 {
     CWebSocket ws;
@@ -700,63 +882,11 @@ static bool SeedFromRelay(CNostrKey& key, const string& relay)
         return false;
     printf("Nostr: connected to %s\n", relay.c_str());
 
-    // Publish our announcement (replaceable event with our ip:port)
-    if (addrLocalHost.ip != 0)
-    {
-        json tags = json::array({
-            json::array({ "d", NOSTR_DTAG }),
-            json::array({ "t", NOSTR_DTAG })
-        });
-        json ev;
-        if (BuildSignedEvent(key, NOSTR_KIND, tags, addrLocalHost.ToStringIPPort(), ev))
-        {
-            json pub = json::array({ "EVENT", ev });
-            ws.SendText(pub.dump());
-        }
-    }
-
     // Publish our self-certifying .btf descriptor (rendezvous discovery)
     PublishDescriptor(ws, key);
 
     // If we run a relay, announce it so others discover it automatically
     PublishRelayAnnouncement(ws, key);
-
-    // Subscribe to receive the announcements of other nodes
-    json filter = json::object();
-    filter["kinds"] = json::array({ NOSTR_KIND });
-    filter["#d"]    = json::array({ NOSTR_DTAG });
-    filter["limit"] = 500;
-    json req = json::array({ "REQ", "bf-sub", filter });
-    if (!ws.SendText(req.dump()))
-        return false;
-
-    // Read responses until EOSE (end of stored events) or timeout
-    int nEvents = 0;
-    for (;;)
-    {
-        string msg;
-        if (!ws.RecvText(msg))
-            break; // timeout or closed connection
-        json j;
-        try { j = json::parse(msg); } catch (...) { continue; }
-        if (!j.is_array() || j.empty()) continue;
-        string type = j[0].get<string>();
-        if (type == "EVENT" && j.size() >= 3)
-        {
-            HandlePeerEvent(j[2]);
-            if (++nEvents > 1000) break;
-        }
-        else if (type == "EOSE")
-        {
-            // We received all stored events; close this relay.
-            break;
-        }
-        else if (type == "NOTICE" || type == "OK" || type == "CLOSED")
-        {
-            // informational
-        }
-    }
-    printf("Nostr: %s returned %d events\n", relay.c_str(), nEvents);
 
     // Discover other nodes' .btf descriptors so we can auto-connect anonymously
     // (no manual /connectbtf). Each node publishes one addressable descriptor
@@ -791,10 +921,15 @@ static bool SeedFromRelay(CNostrKey& key, const string& relay)
                     if (!HexDecode(ev["pubkey"].get<string>(), pkb, 32)) continue;
                     if (memcmp(pkb, key.xonly, 32) == 0) continue; // not ourselves
                     string peerAddr = btf::Address(pkb);
+                    int64 createdAt = ev.value("created_at", (int64)0);
                     bool fNew = false;
                     CRITICAL_BLOCK(cs_btfPeers)
-                        fNew = g_btfPeers.insert(peerAddr).second;
-                    if (fNew)
+                    {
+                        auto it = g_btfPeers.find(peerAddr);
+                        if (it == g_btfPeers.end()) { g_btfPeers[peerAddr] = createdAt; fNew = true; }
+                        else if (createdAt > it->second)  it->second = createdAt; // refresh
+                    }
+                    if (fNew && fDebug)
                         printf("Nostr: discovered .btf peer %s\n", peerAddr.c_str());
                     if (++nPeers > 500) break;
                 }
@@ -838,7 +973,7 @@ static bool SeedFromRelay(CNostrKey& key, const string& relay)
                     CRITICAL_BLOCK(cs_discoveredRelays)
                         if (g_discoveredRelays.size() < BTF_MAX_DISCOVERED_RELAYS)
                             fNew = g_discoveredRelays.insert(r).second;
-                    if (fNew)
+                    if (fNew && fDebug)
                         printf("Nostr: discovered relay %s\n", r.c_str());
                 }
                 else if (type == "EOSE")
@@ -846,7 +981,60 @@ static bool SeedFromRelay(CNostrKey& key, const string& relay)
             }
         }
     }
+
+    // Discover live pool announcements. These are expiring status beacons, not
+    // permanent directory entries, so the GUI can show only fresh pools.
+    ws.SendText(json::array({ "CLOSE", "btf-pools" }).dump());
+    {
+        json pfilter = json::object();
+        pfilter["kinds"] = json::array({ BTF_POOL_KIND });
+        pfilter["#d"]    = json::array({ BTF_POOL_DTAG });
+        pfilter["limit"]  = 200;
+        json preq = json::array({ "REQ", "btf-pools", pfilter });
+        if (ws.SendText(preq.dump()))
+        {
+            for (;;)
+            {
+                string msg;
+                if (!ws.RecvText(msg))
+                    break;
+                json j;
+                try { j = json::parse(msg); } catch (...) { continue; }
+                if (!j.is_array() || j.empty()) continue;
+                string type = j[0].get<string>();
+                if (type == "EVENT" && j.size() >= 3)
+                    HandlePoolAnnouncement(j[2]);
+                else if (type == "EOSE")
+                    break;
+            }
+        }
+    }
     return true;
+}
+
+void ThreadBtfPoolAnnouncer(void*)
+{
+    printf("ThreadBtfPoolAnnouncer started\n");
+    while (!fShutdown)
+    {
+        if (nMineMode == MINE_OPERATOR && gPoolRunning)
+        {
+            BtfPoolAnnouncement ann;
+            ann.btfAddress = BtfLocalAddress();
+            ann.poolName = strPoolName;
+            ann.dashboardUrl = strPoolDashboardUrl;
+            ann.feePercent = dPoolFeePercent;
+            uint64 roundShares = 0;
+            GetPoolOperatorStats(ann.connectedMiners, ann.blocksFound, roundShares);
+            ann.hashRate = 0.0;
+            ann.createdAt = GetTime();
+            if (!ann.btfAddress.empty() && !ann.poolName.empty())
+                BtfPublishPoolAnnouncement(ann);
+        }
+
+        for (int i = 0; i < 60 && !fShutdown; i++)
+            Sleep(1000);
+    }
 }
 
 
@@ -856,56 +1044,117 @@ static bool SeedFromRelay(CNostrKey& key, const string& relay)
 // peers. Backoff grows on repeated failures, capped.
 static map<string, int64> g_btfPeerBackoff;   // addr -> next-try time
 static map<string, int>   g_btfPeerFails;      // addr -> consecutive failures
+static CCriticalSection   cs_btfPeerState;
 
 // Dial the .btf peers discovered on the relays, up to a target connection count.
-// Mirrors ThreadOpenConnections' ref handling: a kept connection holds one ref
-// (owned by fNetworkNode, released on disconnect); a redundant one is released.
+// Connections are attempted in parallel so a single slow/dead relay doesn't
+// stall the entire pass. Each candidate gets its own thread; all threads start
+// at once and we wait for them to finish before returning.
 static void ConnectDiscoveredBtfPeers()
 {
-    vector<string> peers;
+    vector<pair<int64,string>> peersWithAge;
+    int nTotal = 0;
     CRITICAL_BLOCK(cs_btfPeers)
-        peers.assign(g_btfPeers.begin(), g_btfPeers.end());
+    {
+        nTotal = g_btfPeers.size();
+        for (auto& kv : g_btfPeers)
+            peersWithAge.push_back({kv.second, kv.first});
+    }
+    // Sort newest descriptor first — recently-active nodes are much more
+    // likely to be online right now. Stale ones stay in the list as fallback.
+    sort(peersWithAge.begin(), peersWithAge.end(),
+         [](const pair<int64,string>& a, const pair<int64,string>& b){ return a.first > b.first; });
 
-    // Shuffle: the candidate set is sorted, so without this a handful of dead
-    // peers at the front would be retried every pass and the live peers further
-    // down the list would never be reached within the per-pass dial budget.
+    int64 cutoff = GetTime() - BTF_PEER_MAX_AGE;
+    int nFresh = 0;
+    vector<string> peers;
+    for (auto& p : peersWithAge)
+    {
+        if (p.first < cutoff)
+            continue;
+        peers.push_back(p.second);
+        nFresh++;
+    }
+    if (!peers.empty())
+        printf("Nostr: %d fresh peers, %d stale (of %d total)\n", nFresh, nTotal-nFresh, nTotal);
+
+    // Drop stale peers so we stop retrying dead descriptors until they refresh.
+    {
+        CRITICAL_BLOCK(cs_btfPeers)
+        {
+            for (map<string, int64>::iterator it = g_btfPeers.begin(); it != g_btfPeers.end(); )
+            {
+                if (it->second < cutoff)
+                    it = g_btfPeers.erase(it);
+                else
+                    ++it;
+            }
+        }
+    }
+
+    // Shuffle so we don't always retry the same dead peers at the front.
     for (size_t i = peers.size(); i > 1; i--)
         swap(peers[i - 1], peers[(size_t)GetRand(i)]);
 
+    // Pick candidates for this pass (skip those in backoff, cap at budget).
     int64 now = GetTime();
-    int nDials = 0;
-    foreach(const string& addr, peers)
+    vector<string> candidates;
+    CRITICAL_BLOCK(cs_btfPeerState)
     {
-        if (fShutdown) break;
-        if (vNodes.size() >= BTF_TARGET_CONN) break;
-        if (nDials >= BTF_DIALS_PER_PASS) break;
-
-        // Skip peers still in backoff from a recent failure.
-        map<string, int64>::iterator bi = g_btfPeerBackoff.find(addr);
-        if (bi != g_btfPeerBackoff.end() && now < bi->second)
-            continue;
-
-        CNode* pnode = ConnectNodeBtf(addr);
-        if (pnode)
+        for (const string& addr : peers)
         {
-            if (!pnode->fNetworkNode)
-                pnode->fNetworkNode = true; // keep the ref from ConnectNodeBtf
-            else
-                pnode->Release();           // already connected; drop the extra ref
-            g_btfPeerBackoff.erase(addr);   // reachable again
-            g_btfPeerFails.erase(addr);
-        }
-        else
-        {
-            // Exponential-ish backoff: 1,2,4,... minutes, capped at 30.
-            int n = ++g_btfPeerFails[addr];
-            int64 mins = 1;
-            for (int k = 1; k < n && mins < 30; k++) mins *= 2;
-            if (mins > 30) mins = 30;
-            g_btfPeerBackoff[addr] = now + mins * 60;
-            nDials++; // only count real (failed) dial attempts against the budget
+            if ((int)vNodes.size() >= (int)BTF_TARGET_CONN) break;
+            if ((int)candidates.size() >= BTF_DIALS_PER_PASS) break;
+            map<string, int64>::iterator bi = g_btfPeerBackoff.find(addr);
+            if (bi != g_btfPeerBackoff.end() && now < bi->second)
+                continue;
+            candidates.push_back(addr);
         }
     }
+
+    if (candidates.empty()) return;
+
+    // Launch one thread per candidate — all connect attempts run in parallel.
+    // Each thread writes its result back via shared state guarded by cs_btfPeerState.
+    struct DialCtx { string addr; };
+    vector<DialCtx*> ctxs;
+    for (const string& addr : candidates)
+    {
+        DialCtx* ctx = new DialCtx{addr};
+        ctxs.push_back(ctx);
+        _beginthread([](void* arg) {
+            DialCtx* ctx = (DialCtx*)arg;
+            string addr = ctx->addr;
+            delete ctx;
+
+            CNode* pnode = ConnectNodeBtf(addr);
+            CRITICAL_BLOCK(cs_btfPeerState)
+            {
+                if (pnode)
+                {
+                    if (!pnode->fNetworkNode)
+                        pnode->fNetworkNode = true;
+                    else
+                        pnode->Release();
+                    g_btfPeerBackoff.erase(addr);
+                    g_btfPeerFails.erase(addr);
+                }
+                else
+                {
+                    int n = ++g_btfPeerFails[addr];
+                    int64 secs = 30;
+                    for (int k = 1; k < n && secs < 15*60; k++) secs *= 2;
+                    if (secs > 15*60) secs = 15*60;
+                    g_btfPeerBackoff[addr] = GetTime() + secs;
+                }
+            }
+        }, 0, ctx);
+    }
+
+    // Wait long enough for all parallel dials to finish (each has a 10s socket
+    // timeout, so 12s gives them all time to resolve).
+    for (int i = 0; i < 12 && !fShutdown; i++)
+        Sleep(1000);
 }
 
 
@@ -966,9 +1215,25 @@ void ThreadNostrSeed(void* parg)
         }
         CATCH_PRINT_EXCEPTION("ConnectDiscoveredBtfPeers")
 
-        // Re-announce/re-discover periodically (the replaceable event keeps the
-        // relay up to date and picks up nodes that joined after us)
-        for (int i = 0; i < 60 && !fShutdown; i++)
+        if (nMineMode == MINE_OPERATOR && gPoolRunning)
+        {
+            BtfPoolAnnouncement ann;
+            ann.btfAddress = BtfLocalAddress();
+            ann.poolName = strPoolName;
+            ann.dashboardUrl = strPoolDashboardUrl;
+            ann.feePercent = dPoolFeePercent;
+            uint64 roundShares = 0;
+            GetPoolOperatorStats(ann.connectedMiners, ann.blocksFound, roundShares);
+            ann.hashRate = 0.0;
+            ann.createdAt = GetTime();
+            if (!ann.btfAddress.empty() && !ann.poolName.empty())
+                BtfPublishPoolAnnouncement(ann);
+        }
+
+        // Re-discover periodically. Sleep less aggressively when
+        // we have no connections yet so we find peers faster on startup.
+        int nSleepSecs = vNodes.empty() ? 20 : 60;
+        for (int i = 0; i < nSleepSecs && !fShutdown; i++)
             Sleep(1000);
     }
 }

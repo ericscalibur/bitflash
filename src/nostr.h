@@ -15,6 +15,7 @@
 
 // Thread entry point (signature compatible with _beginthread)
 void ThreadNostrSeed(void* parg);
+void ThreadBtfPoolAnnouncer(void* parg);
 
 // Public relays used for discovery. Tunable.
 extern const char* pszNostrRelays[];
@@ -37,6 +38,32 @@ void BtfSetActiveRelay(const std::string& relay);
 extern std::string strBtfAnnounceRelay;
 // Every relay to try: curated seeds + relays discovered from Nostr announcements.
 std::vector<std::string> BtfAllRelays();
+
+struct BtfPoolAnnouncement
+{
+    std::string btfAddress;
+    std::string poolName;
+    std::string dashboardUrl;
+    double feePercent;
+    int connectedMiners;
+    int blocksFound;
+    double hashRate;
+    int64 createdAt;
+
+    BtfPoolAnnouncement()
+        : feePercent(0.0), connectedMiners(0), blocksFound(0), hashRate(0.0), createdAt(0)
+    {
+    }
+};
+
+// Current live pool announcements discovered from Nostr relays.
+void BtfGetPoolAnnouncements(std::vector<BtfPoolAnnouncement>& out);
+
+// Publish a live pool announcement on Nostr.
+bool BtfPublishPoolAnnouncement(const BtfPoolAnnouncement& ann);
+
+// Query the latest pool announcement for a specific .btf pool address.
+bool BtfQueryPoolAnnouncement(const std::string& poolBtfAddr, BtfPoolAnnouncement& out);
 
 // Copy this node's .btf identity (lazily loading or generating it): the x-only
 // pubkey (= the .btf address) and the x25519 secret for the end-to-end channel.

@@ -98,11 +98,38 @@ static SOCKET ConnectTo(const char* host, unsigned short port)
     if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) return INVALID_SOCKET;
     SOCKET s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (s == INVALID_SOCKET) { freeaddrinfo(res); return INVALID_SOCKET; }
+
+    // Apply a short timeout only for the connect() and initial handshake so an
+    // unresponsive relay doesn't block the thread. Once the tunnel is live the
+    // timeout is cleared — a forwarding pipe must block indefinitely on recv().
+#ifdef _WIN32
+    DWORD tvShort = 10000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tvShort, sizeof(tvShort));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tvShort, sizeof(tvShort));
+#else
+    struct timeval tvShort; tvShort.tv_sec = 10; tvShort.tv_usec = 0;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tvShort, sizeof(tvShort));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tvShort, sizeof(tvShort));
+#endif
+
     if (connect(s, res->ai_addr, (int)res->ai_addrlen) != 0)
     {
         CLOSESOCK(s); freeaddrinfo(res); return INVALID_SOCKET;
     }
     freeaddrinfo(res);
+
+    // Clear the timeout — the socket is now a live tunnel and must not
+    // time out when idle. recv() will block until data arrives or peer closes.
+#ifdef _WIN32
+    DWORD tvOff = 0;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tvOff, sizeof(tvOff));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tvOff, sizeof(tvOff));
+#else
+    struct timeval tvOff; tvOff.tv_sec = 0; tvOff.tv_usec = 0;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tvOff, sizeof(tvOff));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tvOff, sizeof(tvOff));
+#endif
+
     return s;
 }
 

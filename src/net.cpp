@@ -98,46 +98,79 @@ bool ConnectSocket(const CAddress& addrConnect, SOCKET& hSocketRet)
 
 bool GetMyExternalIP(unsigned int& ipRet)
 {
-    // The 2009 whatismyip.com service (fixed IP) no longer exists; this avoids
-    // stalling startup on TCP timeouts. The external IP may come from Nostr
-    // relays in the future.
-    return false;
+    // Try several plain-text IP echo services in order.
+    // Each returns just the IPv4 address as the first line of the HTTP body.
+    struct { const char* host; const char* path; } services[] = {
+        { "api4.ipify.org",    "/"          },
+        { "icanhazip.com",     "/"          },
+        { "ipecho.net",        "/plain"     },
+        { "checkip.amazonaws.com", "/"      },
+    };
 
-    CAddress addrConnect("72.233.89.199:80"); // whatismyip.com 198-200
-
-    SOCKET hSocket;
-    if (!ConnectSocket(addrConnect, hSocket))
-        return error("GetMyExternalIP() : connection to %s failed\n", addrConnect.ToString().c_str());
-
-    char* pszGet =
-        "GET /automation/n09230945.asp HTTP/1.1\r\n"
-        "Host: www.whatismyip.com\r\n"
-        "User-Agent: Bitcoin/0.1\r\n"
-        "Connection: close\r\n"
-        "\r\n";
-    send(hSocket, pszGet, strlen(pszGet), 0);
-
-    string strLine;
-    while (RecvLine(hSocket, strLine))
+    for (auto& svc : services)
     {
-        if (strLine.empty())
+        struct addrinfo hints, *res = NULL;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family   = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        if (getaddrinfo(svc.host, "80", &hints, &res) != 0 || !res)
+            continue;
+
+        SOCKET hSocket = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+        if (hSocket == INVALID_SOCKET) { freeaddrinfo(res); continue; }
+
+        // 5-second timeout so a dead service doesn't stall startup
+#ifdef _WIN32
+        DWORD tv = 5000;
+        setsockopt(hSocket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+        setsockopt(hSocket, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
+#else
+        struct timeval tv; tv.tv_sec = 5; tv.tv_usec = 0;
+        setsockopt(hSocket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(hSocket, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
+
+        if (connect(hSocket, res->ai_addr, (int)res->ai_addrlen) != 0)
         {
-            if (!RecvLine(hSocket, strLine))
-            {
-                closesocket(hSocket);
-                return false;
-            }
-            closesocket(hSocket);
-            CAddress addr(strLine.c_str());
-            printf("GetMyExternalIP() received [%s] %s\n", strLine.c_str(), addr.ToString().c_str());
-            if (addr.ip == 0)
-                return false;
-            ipRet = addr.ip;
-            return true;
+            freeaddrinfo(res); closesocket(hSocket); continue;
         }
+        freeaddrinfo(res);
+
+        string req = string("GET ") + svc.path + " HTTP/1.0\r\nHost: " + svc.host + "\r\nConnection: close\r\n\r\n";
+        send(hSocket, req.c_str(), (int)req.size(), 0);
+
+        // Read response, skip HTTP headers, grab first line of body
+        string response;
+        char buf[256];
+        int n;
+        while ((n = recv(hSocket, buf, sizeof(buf)-1, 0)) > 0)
+        {
+            buf[n] = 0;
+            response += buf;
+            if (response.size() > 4096) break;
+        }
+        closesocket(hSocket);
+
+        // Find blank line separating headers from body
+        size_t bodyPos = response.find("\r\n\r\n");
+        if (bodyPos == string::npos) bodyPos = response.find("\n\n");
+        if (bodyPos == string::npos) continue;
+        string body = response.substr(bodyPos + (response[bodyPos+2]=='\r' ? 4 : 2));
+
+        // Trim whitespace
+        while (!body.empty() && (body.back() == '\n' || body.back() == '\r' || body.back() == ' '))
+            body.pop_back();
+
+        // Parse as IP
+        CAddress addr(body.c_str());
+        if (addr.ip == 0) continue;
+
+        printf("GetMyExternalIP() via %s: %s\n", svc.host, body.c_str());
+        ipRet = addr.ip;
+        return true;
     }
-    closesocket(hSocket);
-    return error("GetMyExternalIP() : connection closed\n");
+
+    return error("GetMyExternalIP() : all services failed\n");
 }
 
 
@@ -324,15 +357,15 @@ CNode* ConnectNode(CAddress addrConnect, int64 nTimeout)
         return pnode;
     }
 
-    /// debug print
-    printf("trying %s\n", addrConnect.ToString().c_str());
+    if (fDebug)
+        printf("trying %s\n", addrConnect.ToString().c_str());
 
     // Connect
     SOCKET hSocket;
     if (ConnectSocket(addrConnect, hSocket))
     {
-        /// debug print
-        printf("connected %s\n", addrConnect.ToString().c_str());
+        if (fDebug)
+            printf("connected %s\n", addrConnect.ToString().c_str());
 
         // Add node
         CNode* pnode = new CNode(hSocket, addrConnect, false);
@@ -390,14 +423,15 @@ CNode* ConnectNodeBtf(const string& strBtfAddr)
         return pnode;
     }
 
-    /// debug print
-    printf("trying %s\n", strBtfAddr.c_str());
+    if (fDebug)
+        printf("trying %s\n", strBtfAddr.c_str());
 
     string strMeeting;
     unsigned char enc_pub[32];
     if (!BtfResolve(strBtfAddr, strMeeting, enc_pub))
     {
-        printf("ConnectNodeBtf: could not resolve a descriptor for %s\n", strBtfAddr.c_str());
+        if (fDebug)
+            printf("ConnectNodeBtf: could not resolve a descriptor for %s\n", strBtfAddr.c_str());
         return NULL;
     }
     size_t colon = strMeeting.rfind(':');
@@ -411,12 +445,13 @@ CNode* ConnectNodeBtf(const string& strBtfAddr)
     btf_socket_t hSocket = btf::BtfClientTunnel(strHost.c_str(), (unsigned short)nPort, pk, enc_pub);
     if (hSocket == INVALID_SOCKET)
     {
-        printf("ConnectNodeBtf: tunnel to %s via %s failed\n", strBtfAddr.c_str(), strMeeting.c_str());
+        if (fDebug)
+            printf("ConnectNodeBtf: tunnel to %s via %s failed\n", strBtfAddr.c_str(), strMeeting.c_str());
         return NULL;
     }
 
-    /// debug print
-    printf("connected %s via rendezvous %s\n", strBtfAddr.c_str(), strMeeting.c_str());
+    if (fDebug)
+        printf("connected %s via rendezvous %s\n", strBtfAddr.c_str(), strMeeting.c_str());
 
     // Add node
     pnode = new CNode(hSocket, addr, false);
@@ -1152,15 +1187,21 @@ bool StartNode(string& strError)
         return false;
     }
 
-    // Get our external IP address for incoming connections
+    // Get our external IP in a background thread — up to 4 HTTP requests with
+    // 5s timeouts each could otherwise delay startup by 20s on first run.
+    // addrIncoming from a previous session is used immediately as a fallback.
     if (addrIncoming.ip)
         addrLocalHost.ip = addrIncoming.ip;
 
-    if (GetMyExternalIP(addrLocalHost.ip))
-    {
-        addrIncoming = addrLocalHost;
-        CWalletDB().WriteSetting("addrIncoming", addrIncoming);
-    }
+    _beginthread([](void*) {
+        unsigned int ip = addrLocalHost.ip;
+        if (GetMyExternalIP(ip)) {
+            addrLocalHost.ip = ip;
+            addrIncoming = addrLocalHost;
+            CWalletDB().WriteSetting("addrIncoming", addrIncoming);
+            printf("External IP updated: %s\n", addrLocalHost.ToStringIP().c_str());
+        }
+    }, 0, NULL);
 
     // Peer discovery over Nostr relays (replaces the old IRC seed)
     if (_beginthread(ThreadNostrSeed, 0, NULL) == -1)

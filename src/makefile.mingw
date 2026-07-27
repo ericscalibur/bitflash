@@ -1,44 +1,83 @@
-# Bitflash -- build for MSYS2 UCRT64 (modern g++ + wxWidgets 3.2 + OpenSSL 3 + Berkeley DB 6)
-# Based on Satoshi Nakamoto's original 2009 makefile (MIT/X11)
-# Usage: (UCRT64 shell)  mingw32-make -f makefile.mingw
+# Bitflash Windows build — ImGui + GLFW + OpenGL3
+# Run from MSYS2 UCRT64: make -f makefile.mingw
 
 CXX = g++
-WXCXXFLAGS := $(shell wx-config --cxxflags)
-WXLIBS     := $(shell wx-config --libs std,richtext,html)
-WXRCFLAGS  := $(filter -I%,$(shell wx-config --cxxflags)) $(filter -D%,$(shell wx-config --cxxflags))
 
-DEFS = -DWIN32 -D__WXMSW__ -D_WINDOWS -DNOPCH
-# Path to the project's built dependencies (libsecp256k1 with Schnorr, RandomX)
-DEPS = ../deps
-RANDOMX = ../RandomX
-CXXFLAGS = -std=gnu++14 -O2 -w -fpermissive -Wno-deprecated-declarations -pthread $(DEFS) -I$(DEPS)/include -I$(RANDOMX)/src $(WXCXXFLAGS)
-HEADERS = headers.h util.h main.h serialize.h uint256.h key.h bignum.h script.h db.h base58.h net.h irc.h nostr.h randomx_pow.h btfaddr.h btfchan.h btfrv.h btftunnel.h market.h uibase.h ui.h
+DEPS      = ../deps
+RANDOMX   = ../RandomX
+IMGUI_DIR = imgui
 
-LIBS = \
- -ldb_cxx \
- -L$(DEPS)/lib -lsecp256k1 \
- -L$(RANDOMX)/build -lrandomx \
- -lsodium \
- -lssl -lcrypto \
- -lkernel32 -luser32 -lgdi32 -lcomdlg32 -lwinspool -lwinmm -lshell32 -lcomctl32 \
- -lole32 -loleaut32 -luuid -lrpcrt4 -ladvapi32 -lws2_32 -lmswsock -lcrypt32 -pthread
+CXXFLAGS = -std=gnu++14 -O2 -w -fpermissive -Wno-deprecated-declarations -pthread \
+           -DWIN32 -DNOPCH \
+           -DSECP256K1_STATIC \
+           -I$(DEPS)/include -I$(RANDOMX)/src \
+           -I$(DEPS)/include/nlohmann \
+           -IC:/msys64/ucrt64/include \
+           -I$(IMGUI_DIR)
 
-OBJS = obj/util.o obj/script.o obj/db.o obj/net.o obj/main.o obj/market.o \
-       obj/ui.o obj/uibase.o obj/sha.o obj/irc.o obj/nostr.o obj/randomx_pow.o obj/btfaddr.o obj/btfchan.o obj/btfrv.o obj/btftunnel.o obj/ui_res.o
+LIBS = -L$(DEPS)/lib -lsecp256k1 \
+       -L$(RANDOMX)/build -lrandomx \
+       -lsodium -lssl -lcrypto -ldb_cxx -lpthread \
+       -LC:/msys64/ucrt64/lib \
+       -lglfw3 -lopengl32 -lgdi32 \
+       -lkernel32 -luser32 -lcomdlg32 -lwinspool -lwinmm \
+       -lshell32 -lcomctl32 -lole32 -loleaut32 -luuid \
+       -lrpcrt4 -ladvapi32 -lws2_32 -lmswsock -lcrypt32
+
+IMGUI_OBJS = obj/imgui.o obj/imgui_draw.o obj/imgui_tables.o \
+             obj/imgui_widgets.o obj/imgui_impl_glfw.o obj/imgui_impl_opengl3.o
+
+NODE_OBJS = obj/util.o obj/script.o obj/db.o obj/net.o obj/main.o \
+            obj/market.o obj/sha.o obj/irc.o obj/nostr.o obj/randomx_pow.o \
+            obj/btfaddr.o obj/btfchan.o obj/btfrv.o obj/btftunnel.o obj/rpc.o
+
+GUI_OBJS = obj/gui.o obj/main_gui.o obj/bitflash_res.o
+
+HEADERS = headers_core.h headers.h util.h main.h serialize.h uint256.h \
+          key.h bignum.h script.h db.h base58.h net.h irc.h nostr.h \
+          randomx_pow.h btfaddr.h btfchan.h btfrv.h btftunnel.h market.h
 
 all: bitflash.exe
 
+obj/bitflash_res.o: bitflash.rc rc/bitcoin.ico
+	mkdir -p obj
+	windres -o $@ -i bitflash.rc
+
 obj/%.o: %.cpp $(HEADERS)
+	mkdir -p obj
 	$(CXX) -c $(CXXFLAGS) -o $@ $<
 
 obj/sha.o: sha.cpp sha.h
+	mkdir -p obj
 	$(CXX) -c $(CXXFLAGS) -O3 -o $@ $<
 
-obj/ui_res.o: ui.rc rc/bitcoin.ico rc/check.ico
-	windres $(DEFS) $(WXRCFLAGS) -o $@ -i $<
+obj/imgui.o:              $(IMGUI_DIR)/imgui.cpp
+	mkdir -p obj
+	$(CXX) -c $(CXXFLAGS) -o $@ $<
 
-bitflash.exe: $(OBJS)
-	$(CXX) $(CXXFLAGS) -mwindows -Wl,--subsystem,windows -o $@ $(OBJS) $(WXLIBS) $(LIBS)
+obj/imgui_draw.o:         $(IMGUI_DIR)/imgui_draw.cpp
+	mkdir -p obj
+	$(CXX) -c $(CXXFLAGS) -o $@ $<
+
+obj/imgui_tables.o:       $(IMGUI_DIR)/imgui_tables.cpp
+	mkdir -p obj
+	$(CXX) -c $(CXXFLAGS) -o $@ $<
+
+obj/imgui_widgets.o:      $(IMGUI_DIR)/imgui_widgets.cpp
+	mkdir -p obj
+	$(CXX) -c $(CXXFLAGS) -o $@ $<
+
+obj/imgui_impl_glfw.o:    $(IMGUI_DIR)/imgui_impl_glfw.cpp
+	mkdir -p obj
+	$(CXX) -c $(CXXFLAGS) -o $@ $<
+
+obj/imgui_impl_opengl3.o: $(IMGUI_DIR)/imgui_impl_opengl3.cpp
+	mkdir -p obj
+	$(CXX) -c $(CXXFLAGS) -o $@ $<
+
+bitflash.exe: $(IMGUI_OBJS) $(NODE_OBJS) $(GUI_OBJS)
+	$(CXX) $(CXXFLAGS) -mwindows -o $@ $^ $(LIBS)
+	@echo "Built: bitflash.exe"
 
 clean:
-	rm -f obj/*.o bitflash.exe
+	rm -rf obj bitflash.exe

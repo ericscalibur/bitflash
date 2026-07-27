@@ -19,7 +19,8 @@ echo "==> installing system packages"
 if command -v apt-get >/dev/null 2>&1; then
   $SUDO apt-get update
   $SUDO apt-get install -y build-essential cmake git pkg-config autoconf libtool \
-       libssl-dev libdb5.3++-dev libsodium-dev nlohmann-json3-dev libboost-dev
+       libssl-dev libdb5.3++-dev libsodium-dev nlohmann-json3-dev libboost-dev \
+       libboost-system-dev libwxgtk3.2-dev
 else
   echo "!! non-apt system: install manually -> g++ cmake git autoconf libtool"
   echo "   libssl-dev libdb++-dev libsodium-dev nlohmann-json (headers)"
@@ -56,16 +57,16 @@ else
   echo "==> RandomX already built, skipping"
 fi
 
-# ---- the node
-echo "==> building bitflash-node"
+# ---- build
+echo "==> building bitflash"
 cd "$ROOT/src"
 make -f makefile.linux RANDOMX_DIR="$HOME/RandomX" -j"$(nproc)"
 
 echo
 echo "==================================================================="
-echo " DONE.  Binary: $ROOT/src/bitflash-node"
+echo " DONE.  $ROOT/src/bitflash"
 echo
-echo " Mine:              ./src/bitflash-node -gen"
-echo " Custom data dir:   ./src/bitflash-node -gen -datadir=\$HOME/.bitflash"
-echo " Run as a service:  see linux-node.service note in the README"
+echo "   GUI:         ./src/bitflash"
+echo "   Daemon mode: ./src/bitflash /nogui /gen"
+echo "   Pool server starts automatically on Stratum :3333, stats :19012"
 echo "==================================================================="

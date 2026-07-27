@@ -48,7 +48,37 @@ extern CBlockIndex* pindexBest;
 extern unsigned int nTransactionsUpdated;
 extern string strSetDataDir;
 extern int nDropMessagesTest;
+// Mining mode — persisted in wallet.dat
+//   MINE_SOLO (0):        mine to own wallet, no pool server
+//   MINE_OPERATOR (1):    run pool server, mine to own wallet, distribute to miners
+//   MINE_PARTICIPANT (2): connect to external pool, submit shares, receive payouts
+#define MINE_SOLO        0
+#define MINE_OPERATOR    1
+#define MINE_PARTICIPANT 2
+extern int    nMineMode;
+extern string strParticipantPool; // participant: pool .btf address
+extern string strPoolName;        // operator: announced pool name
+extern string strPoolDashboardUrl; // operator: optional dashboard URL
+extern double dPoolFeePercent;     // operator: announced fee percent
 extern bool fSoloMineTest; // /solomine: mine without requiring a peer (local test)
+extern bool gPoolServerRunning;    // GUI/startup state
+extern volatile bool gPoolRunning; // runtime pool server loop flag (rpc.cpp)
+
+struct PendingPayoutView
+{
+    int matureAtHeight;
+    int recipients;
+    int64 totalAmount;
+};
+
+struct PoolWorkerStatView
+{
+    std::string address;
+    std::string worker;
+    uint64 totalShares;
+    uint64 roundShares;
+    int64 lastSeen;
+};
 
 // Settings
 extern int fGenerateBitcoins;
@@ -72,7 +102,17 @@ void RelayWalletTransactions();
 bool LoadBlockIndex(bool fAllowNew=true);
 void PrintBlockTree();
 bool BitcoinMiner();
+void ThreadRPCServer(void* parg);  // rpc.cpp — .btf pool server
+void GetParticipantMiningStats(uint64& sharesSent, uint64& sharesAccepted, double& hashRate);
+void SetParticipantMiningStatus(const std::string& status);
+std::string GetParticipantMiningStatus();
+void GetPoolOperatorStats(int& authorizedMiners, int& blocksFound, uint64& roundShares);
+void GetPoolWorkerStats(std::vector<PoolWorkerStatView>& out);
+void GetPendingPayouts(std::vector<PendingPayoutView>& out);
 bool ProcessMessages(CNode* pfrom);
+bool ProcessBlock(CNode* pfrom, CBlock* pblock);
+unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast);
+extern CCriticalSection cs_mapTransactions;
 bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv);
 bool SendMessages(CNode* pto);
 int64 GetBalance();
@@ -351,7 +391,7 @@ public:
     {
         if (scriptPubKey.size() < 6)
             return "CTxOut(error)";
-        return strprintf("CTxOut(nValue=%I64d.%08I64d, scriptPubKey=%s)", nValue / COIN, nValue % COIN, scriptPubKey.ToString().substr(0,24).c_str());
+        return strprintf("CTxOut(nValue=%lld.%08lld, scriptPubKey=%s)", nValue / COIN, nValue % COIN, scriptPubKey.ToString().substr(0,24).c_str());
     }
 
     void print() const

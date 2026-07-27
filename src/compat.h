@@ -175,19 +175,7 @@ inline void SetThreadPriority(void*, int) {}
 #define THREAD_PRIORITY_NORMAL 0
 #endif
 
-// ---- wxWidgets shims (the headless build has no GUI; the few core call sites
-//      degrade to console/no-op) ----
-#define wxTheApp ((void*)0)
-#ifndef wxOK
-#define wxOK 0
-#define wxICON_ERROR 0
-#define wxICON_EXCLAMATION 0
-#define wxICON_INFORMATION 0
-#endif
-inline void wxMessageBox(const std::string& msg, const std::string& caption = "", long = 0)
-{
-    fprintf(stderr, "%s%s%s\n", caption.c_str(), caption.empty() ? "" : ": ", msg.c_str());
-}
+// wx is always available (wx/wx.h included via headers.h); no shims needed.
 
 #endif // !_WIN32
 #endif // BITFLASH_COMPAT_H

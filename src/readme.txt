@@ -43,6 +43,19 @@ Command-line options (in addition to the original ones)
 -------------------------------------------------------
   /port=N        listen on P2P port N (default 8433)
   /solomine      mine without requiring a connected peer (local testing)
+  /operator      operator mode (run pool server)
+  /participant=ADDR
+                 participant mode; mine to pool .btf address ADDR
+  /poolname=NAME operator announcement pool name
+  /poolfee=PCT   operator announcement fee percent (example: 0.75)
+  /pooldashboard=URL
+                 operator announcement dashboard URL
+  /connectbtf=ADDR
+                 keep an outbound .btf connection to ADDR
+  /rvrelay=HOST:PORT
+                 override meeting relay list with one relay
+  /announcerelay=HOST:PORT
+                 announce this relay on Nostr for discovery
 
 
 Roadmap

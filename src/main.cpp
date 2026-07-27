@@ -2,8 +2,26 @@
 // Distributed under the MIT/X11 software license, see the accompanying
 // file license.txt or http://www.opensource.org/licenses/mit-license.php.
 
+#pragma push_macro("snprintf")
+#undef snprintf
+#include <nlohmann/json.hpp>
+#pragma pop_macro("snprintf")
+#ifdef snprintf
+#undef snprintf
+#endif
 #include "headers.h"
 #include "sha.h"
+#include <atomic>
+#include <mutex>
+#include "btfaddr.h"
+#include "btftunnel.h"
+#ifndef _WIN32
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <unistd.h>
+#endif
 
 
 
@@ -55,7 +73,40 @@ bool fSoloMineTest = false; // /solomine: mine without requiring a peer (local t
 int fGenerateBitcoins;
 int64 nTransactionFee = 0;
 CAddress addrIncoming;
+int    nMineMode        = MINE_SOLO;
+string strParticipantPool;           // participant mode: pool .btf address
+string strPoolName       = "Bitflash Pool";
+string strPoolDashboardUrl;
+double dPoolFeePercent   = 0.0;
 
+static std::atomic<uint64> gParticipantSharesSent{0};
+static std::atomic<uint64> gParticipantSharesAccepted{0};
+static std::atomic<uint64> gParticipantHashes{0};
+static std::atomic<uint64> gParticipantHashRateX1000{0};
+static std::mutex gParticipantStatusMutex;
+static std::string gParticipantStatus;
+
+void SetParticipantMiningStatus(const std::string& status)
+{
+    std::lock_guard<std::mutex> lk(gParticipantStatusMutex);
+    if (gParticipantStatus == status)
+        return;
+    gParticipantStatus = status;
+    printf("PoolParticipantMiner: status -> %s\n", status.c_str());
+}
+
+std::string GetParticipantMiningStatus()
+{
+    std::lock_guard<std::mutex> lk(gParticipantStatusMutex);
+    return gParticipantStatus;
+}
+
+void GetParticipantMiningStats(uint64& sharesSent, uint64& sharesAccepted, double& hashRate)
+{
+    sharesSent = gParticipantSharesSent.load();
+    sharesAccepted = gParticipantSharesAccepted.load();
+    hashRate = (double)gParticipantHashRateX1000.load() / 1000.0;
+}
 
 
 
@@ -2228,8 +2279,281 @@ void BlockSHA256(const void* pin, unsigned int nBlocks, void* pout)
 }
 
 
+// ---------------------------------------------------------------------------
+// Participant pool miner — connects to an external Stratum server, receives
+// RandomX jobs, hashes with the local CPU, and submits shares.
+// Called from BitcoinMiner() when nMineMode == MINE_PARTICIPANT.
+// ---------------------------------------------------------------------------
+
+using json = nlohmann::json;
+
+static std::string ToHexStr(const void* p, size_t n)
+{
+    const unsigned char* b = (const unsigned char*)p;
+    std::string s; s.reserve(n*2);
+    static const char* H = "0123456789abcdef";
+    for (size_t i = 0; i < n; i++) { s += H[b[i]>>4]; s += H[b[i]&0xf]; }
+    return s;
+}
+
+static std::vector<unsigned char> FromHexStr(const std::string& s)
+{
+    std::vector<unsigned char> v;
+    for (size_t i = 0; i+1 < s.size(); i += 2) {
+        auto h=[](char c)->int{
+            if(c>='0'&&c<='9')return c-'0';
+            if(c>='a'&&c<='f')return c-'a'+10;
+            if(c>='A'&&c<='F')return c-'A'+10;
+            return 0;
+        };
+        v.push_back((unsigned char)((h(s[i])<<4)|h(s[i+1])));
+    }
+    return v;
+}
+
+static void UpdateParticipantHashRate(uint64 hashesSinceSample, int64 sampleStart)
+{
+    int64 now = GetTime();
+    int64 elapsed = now - sampleStart;
+    if (elapsed <= 0)
+        elapsed = 1;
+    double rate = (double)hashesSinceSample / (double)elapsed;
+    gParticipantHashRateX1000.store((uint64)(rate * 1000.0));
+}
+
+static bool StratumSendLine(SOCKET s, const json& j)
+{
+    std::string line = j.dump() + "\n";
+    int sent = 0, total = (int)line.size();
+    while (sent < total) {
+        int r = send(s, line.c_str()+sent, total-sent, 0);
+        if (r <= 0) return false;
+        sent += r;
+    }
+    return true;
+}
+
+static bool StratumRecvLine(SOCKET s, std::string& buf, std::string& line)
+{
+    while (true) {
+        size_t pos = buf.find('\n');
+        if (pos != std::string::npos) {
+            line = buf.substr(0, pos);
+            if (!line.empty() && line.back()=='\r') line.pop_back();
+            buf = buf.substr(pos+1);
+            return true;
+        }
+        char tmp[4096];
+        int r = recv(s, tmp, sizeof(tmp)-1, 0);
+        if (r <= 0) return false;
+        tmp[r] = 0;
+        buf += tmp;
+    }
+}
+
+static bool PoolParticipantMiner()
+{
+    printf("PoolParticipantMiner: connecting to %s\n", strParticipantPool.c_str());
+    SetParticipantMiningStatus("resolving pool address");
+
+    if (strParticipantPool.empty()) {
+        printf("PoolParticipantMiner: no pool selected\n");
+        SetParticipantMiningStatus("no pool selected");
+        return false;
+    }
+
+    unsigned char target_pubkey[32];
+    if (!btf::ParseAddress(strParticipantPool, target_pubkey)) {
+        printf("PoolParticipantMiner: invalid .btf address %s\n", strParticipantPool.c_str());
+        SetParticipantMiningStatus("invalid pool address");
+        return false;
+    }
+
+    std::string meetingHostPort;
+    unsigned char service_enc_pub[32];
+    if (!BtfResolve(strParticipantPool, meetingHostPort, service_enc_pub)) {
+        printf("PoolParticipantMiner: failed to resolve %s\n", strParticipantPool.c_str());
+        SetParticipantMiningStatus("failed to resolve pool");
+        return false;
+    }
+
+    size_t colon = meetingHostPort.rfind(':');
+    if (colon == std::string::npos) {
+        printf("PoolParticipantMiner: bad meeting node %s\n", meetingHostPort.c_str());
+        SetParticipantMiningStatus("bad pool endpoint");
+        return false;
+    }
+    std::string host = meetingHostPort.substr(0, colon);
+    int port = atoi(meetingHostPort.substr(colon + 1).c_str());
+    if (port <= 0 || port > 65535) {
+        printf("PoolParticipantMiner: bad meeting port %d\n", port);
+        SetParticipantMiningStatus("bad pool port");
+        return false;
+    }
+
+    btf_socket_t s = btf::BtfClientTunnel(host.c_str(), (unsigned short)port, target_pubkey, service_enc_pub);
+    if (s == INVALID_SOCKET) {
+        printf("PoolParticipantMiner: tunnel connect failed via %s\n", meetingHostPort.c_str());
+        SetParticipantMiningStatus("tunnel connect failed");
+        return false;
+    }
+    printf("PoolParticipantMiner: connected via %s\n", meetingHostPort.c_str());
+    SetParticipantMiningStatus("tunnel connected");
+
+    // Use our wallet address as mining username so payouts go to our wallet
+    std::string username;
+    {
+        std::vector<unsigned char> vchPubKey;
+        if (CWalletDB("r").ReadDefaultKey(vchPubKey))
+            username = PubKeyToAddress(vchPubKey);
+    }
+    if (username.empty()) username = BtfLocalAddress();
+    if (username.empty()) username = "unknown";
+
+    std::string buf;
+    int msgId = 1;
+    std::set<int> pendingSubmitIds;
+
+    // Subscribe
+    SetParticipantMiningStatus("subscribing");
+    if (!StratumSendLine(s, json{{"id",msgId++},{"method","mining.subscribe"},{"params",json::array()}}))
+        { SetParticipantMiningStatus("subscribe failed"); closesocket(s); return false; }
+
+    // Authorize
+    SetParticipantMiningStatus("authorizing");
+    if (!StratumSendLine(s, json{{"id",msgId++},{"method","mining.authorize"},
+                                 {"params",json::array({username,"x"})}}))
+        { SetParticipantMiningStatus("authorize failed"); closesocket(s); return false; }
+
+    // Job state
+    std::string jobId;
+    unsigned char header[80];
+    uint256 target;
+    bool haveJob = false;
+    bool gotSubscribeAck = false;
+    bool gotAuthorizeAck = false;
+    int64 authWaitStart = 0;
+    unsigned int nNonce = 1;
+    uint64 hashesSinceSample = 0;
+    int64 sampleStart = GetTime();
+
+    void* rxvm = RandomXCreateMinerVM();
+    if (!rxvm) { SetParticipantMiningStatus("failed to start RandomX miner"); closesocket(s); return false; }
+    printf("PoolParticipantMiner: RandomX VM ready (%s)\n",
+           RandomXFastReady() ? "fast 2GB" : "light 256MB");
+    SetParticipantMiningStatus("authorized; asking pool for work");
+
+    while (fGenerateBitcoins && nMineMode == MINE_PARTICIPANT && !fShutdown)
+    {
+        // Non-blocking receive check
+        {
+            fd_set fds; FD_ZERO(&fds); FD_SET(s, &fds);
+            struct timeval tv={0,50000}; // 50ms
+            if (select((int)s+1, &fds, NULL, NULL, &tv) > 0) {
+                std::string line;
+                if (!StratumRecvLine(s, buf, line)) break;
+                try {
+                    json msg = json::parse(line);
+                    if (msg.contains("id") && msg["id"].is_number_integer() && msg.contains("result")) {
+                        int id = msg["id"].get<int>();
+                        if (id == 1 && msg["result"].is_boolean() && msg["result"].get<bool>()) {
+                            gotSubscribeAck = true;
+                            SetParticipantMiningStatus("subscribed; authorizing");
+                        } else if (id == 2 && msg["result"].is_boolean()) {
+                            gotAuthorizeAck = msg["result"].get<bool>();
+                            authWaitStart = GetTime();
+                            SetParticipantMiningStatus(gotAuthorizeAck ? "authorized; asking pool for work" : "authorization rejected");
+                        }
+                        if (pendingSubmitIds.erase(id) > 0) {
+                            if (msg["result"].is_boolean() && msg["result"].get<bool>()) {
+                                gParticipantSharesAccepted.fetch_add(1);
+                                SetParticipantMiningStatus("share accepted");
+                            } else {
+                                SetParticipantMiningStatus("share rejected");
+                            }
+                        }
+                    }
+                    std::string method = msg.value("method","");
+                    if (method == "mining.notify") {
+                        auto& p = msg["params"];
+                        jobId = p[0].get<std::string>();
+                        // p[1] = full 80-byte header hex
+                        auto hdrBytes = FromHexStr(p[1].get<std::string>());
+                        if (hdrBytes.size() >= 80)
+                            memcpy(header, hdrBytes.data(), 80);
+                        // p[3] = share target hex (little-endian uint256)
+                        auto tgtBytes = FromHexStr(p[3].get<std::string>());
+                        if (tgtBytes.size() >= 32)
+                            memcpy(&target, tgtBytes.data(), 32);
+                        haveJob = true;
+                        nNonce = 1;
+                        SetParticipantMiningStatus("job received; hashing");
+                        printf("PoolParticipantMiner: new job %s\n", jobId.c_str());
+                    } else if (method == "mining.set_difficulty") {
+                        // acknowledged, we use the target from notify
+                    }
+                } catch(...) {}
+            }
+        }
+
+        if (gotAuthorizeAck && !haveJob && authWaitStart > 0 && GetTime() - authWaitStart > 10) {
+            SetParticipantMiningStatus("authorized; waiting for pool notify");
+            authWaitStart = 0;
+        }
+
+        if (!haveJob) { Sleep(100); continue; }
+
+        // Hash one nonce
+        memcpy(header+76, &nNonce, 4);
+        uint256 hash = RandomXHashWithVM(rxvm, header, 80);
+        hashesSinceSample++;
+        gParticipantHashes.fetch_add(1);
+        if ((hashesSinceSample & 0x3ff) == 0)
+            UpdateParticipantHashRate(hashesSinceSample, sampleStart);
+
+        if (hash <= target) {
+            printf("PoolParticipantMiner: share found! nonce=%u\n", nNonce);
+            SetParticipantMiningStatus("share found; submitting");
+            int submitId = msgId++;
+            pendingSubmitIds.insert(submitId);
+            gParticipantSharesSent.fetch_add(1);
+            json submit = {{"id",submitId},{"method","mining.submit"},
+                           {"params",json::array({username, jobId,
+                                                  ToHexStr(&nNonce,4)})}};
+            if (!StratumSendLine(s, submit)) break;
+        }
+
+        nNonce++;
+        if (nNonce == 0) { haveJob = false; } // exhausted, wait for new job
+    }
+
+    RandomXDestroyMinerVM(rxvm);
+    closesocket(s);
+    UpdateParticipantHashRate(hashesSinceSample, sampleStart);
+    SetParticipantMiningStatus("participant miner stopped");
+    printf("PoolParticipantMiner: disconnected\n");
+    return true;
+}
+
 bool BitcoinMiner()
 {
+    // Participant mode: connect to external pool instead of mining solo/operator
+    if (nMineMode == MINE_PARTICIPANT)
+    {
+        while (fGenerateBitcoins && nMineMode == MINE_PARTICIPANT && !fShutdown) {
+            PoolParticipantMiner();
+            if (fGenerateBitcoins && nMineMode == MINE_PARTICIPANT && !fShutdown) {
+                printf("PoolParticipantMiner: reconnecting in 10s\n");
+                for (int i = 0; i < 10 && !fShutdown; i++) Sleep(1000);
+            }
+        }
+        return true;
+    }
+
+    // Operator mode only serves the pool; it does not mine solo.
+    if (nMineMode == MINE_OPERATOR)
+        return true;
+
     printf("BitcoinMiner started\n");
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
 
@@ -2259,6 +2583,8 @@ bool BitcoinMiner()
         txNew.vin[0].prevout.SetNull();
         txNew.vin[0].scriptSig << nBits << ++bnExtraNonce;
         txNew.vout.resize(1);
+        // Always pay coinbase to own wallet key. In operator mode, the pool
+        // server distributes shares to miners via SendMoney() after each block.
         txNew.vout[0].scriptPubKey << key.GetPubKey() << OP_CHECKSIG;
 
 
@@ -2437,7 +2763,7 @@ int64 GetBalance()
     }
 
     QueryPerformanceCounter((LARGE_INTEGER*)&nEnd);
-    ///printf(" GetBalance() time = %16I64d\n", nEnd - nStart);
+    ///printf(" GetBalance() time = %16lld\n", nEnd - nStart);
     return nTotal;
 }
 
@@ -2670,12 +2996,10 @@ bool SendMoney(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew)
                 strError = strprintf("Error: This is an oversized transaction that requires a transaction fee of %s ", FormatMoney(nFeeRequired).c_str());
             else
                 strError = "Error: Transaction creation failed ";
-            wxMessageBox(strError, "Sending...");
             return error("SendMoney() : %s\n", strError.c_str());
         }
         if (!CommitTransactionSpent(wtxNew))
         {
-            wxMessageBox("Error finalizing transaction", "Sending...");
             return error("SendMoney() : Error finalizing transaction");
         }
 
@@ -2686,8 +3010,6 @@ bool SendMoney(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew)
         {
             // This must not fail. The transaction has already been signed and recorded.
             throw runtime_error("SendMoney() : wtxNew.AcceptTransaction() failed\n");
-            wxMessageBox("Error: Transaction not valid", "Sending...");
-            return error("SendMoney() : Error: Transaction not valid");
         }
         wtxNew.RelayWalletTransaction();
     }

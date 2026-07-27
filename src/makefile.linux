@@ -1,48 +1,55 @@
-# Bitflash headless node/miner -- Linux build (no wxWidgets, no GUI).
-# Produces `bitflash-node`: loads the chain + wallet, runs the P2P/Nostr node
-# with anonymous .btf auto-discovery, and mines with RandomX (-gen).
+# Bitflash Linux build — GUI wallet + pool server + daemon mode.
+# Requires: bash build-linux.sh  (installs deps, builds secp256k1 + RandomX)
+# Result:   src/bitflash
 #
-# Deps are set up by ../build-linux.sh. Override paths on the make line if your
-# secp256k1 / RandomX live elsewhere:
-#   make -f makefile.linux SECP_INC=... SECP_LIB=... RANDOMX_DIR=...
+#   ./bitflash              — GUI wallet
+#   ./bitflash /nogui /gen  — headless daemon (same binary, no window)
 
 CXX ?= g++
 
-# secp256k1 (schnorrsig + extrakeys), installed by build-linux.sh
 SECP_INC    ?= /usr/local/include
 SECP_LIB    ?= /usr/local/lib
-# RandomX source tree (headers in src/, static lib in build/)
 RANDOMX_DIR ?= $(HOME)/RandomX
+
+WX_CFLAGS := $(shell wx-config --cxxflags)
+WX_LIBS   := $(shell wx-config --libs)
 
 CXXFLAGS = -std=gnu++14 -O2 -w -fpermissive -pthread \
            -DSECP256K1_STATIC \
-           -I$(SECP_INC) -I$(RANDOMX_DIR)/src
+           -I$(SECP_INC) -I$(RANDOMX_DIR)/src \
+           -I/usr/include/nlohmann \
+           $(WX_CFLAGS)
 
 LIBS = -L$(SECP_LIB) -lsecp256k1 \
        -L$(RANDOMX_DIR)/build -lrandomx \
-       -lsodium -lssl -lcrypto -ldb_cxx -lpthread
+       -lsodium -lssl -lcrypto -ldb_cxx -lpthread \
+       -lboost_system \
+       $(WX_LIBS)
 
 HEADERS = headers.h util.h main.h serialize.h uint256.h key.h bignum.h script.h \
           db.h base58.h net.h irc.h nostr.h randomx_pow.h btfaddr.h btfchan.h \
-          btfrv.h btftunnel.h market.h compat.h
+          btfrv.h btftunnel.h market.h compat.h uibase.h ui.h
 
 OBJS = obj/util.o obj/script.o obj/db.o obj/net.o obj/main.o obj/market.o \
        obj/sha.o obj/irc.o obj/nostr.o obj/randomx_pow.o \
-       obj/btfaddr.o obj/btfchan.o obj/btfrv.o obj/btftunnel.o obj/headless.o
+       obj/btfaddr.o obj/btfchan.o obj/btfrv.o obj/btftunnel.o \
+       obj/rpc.o obj/uibase.o obj/ui.o
 
-all: bitflash-node
+all: bitflash
 
 obj/%.o: %.cpp $(HEADERS)
 	@mkdir -p obj
 	$(CXX) -c $(CXXFLAGS) -o $@ $<
 
-# sha gets -O3 like the Windows makefile
 obj/sha.o: sha.cpp sha.h
 	@mkdir -p obj
 	$(CXX) -c $(CXXFLAGS) -O3 -o $@ $<
 
-bitflash-node: $(OBJS)
+bitflash: $(OBJS)
 	$(CXX) $(CXXFLAGS) -o $@ $(OBJS) $(LIBS)
+	@echo "Built: bitflash"
+	@echo "  GUI:     ./bitflash"
+	@echo "  Daemon:  ./bitflash /nogui /gen"
 
 clean:
-	rm -rf obj bitflash-node
+	rm -rf obj bitflash

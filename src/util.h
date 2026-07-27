@@ -231,11 +231,28 @@ void PrintHex(const T pbegin, const T pend, const char* pszFormat="%s", bool fSp
 
 
 
+// Forward declaration — defined in main.cpp
+string GetAppDir();
+
 inline int OutputDebugStringF(const char* pszFormat, ...)
 {
-#if 1 // debug.log always enabled (was previously only under __WXDEBUG__)
-    // log file
-    FILE* fileout = fopen("debug.log", "a");
+#if 1 // debug.log always enabled
+    // Write to data directory so it's always findable
+    static string strDebugFile;
+    if (strDebugFile.empty()) {
+        string dir = GetAppDir();
+        if (!dir.empty())
+            strDebugFile = dir + 
+#ifdef _WIN32
+                "\\"
+#else
+                "/"
+#endif
+                + "debug.log";
+        else
+            strDebugFile = "debug.log";
+    }
+    FILE* fileout = fopen(strDebugFile.c_str(), "a");
     if (fileout)
     {
         va_list arg_ptr;
@@ -296,14 +313,10 @@ inline int OutputDebugStringF(const char* pszFormat, ...)
     }
 #endif
 
-    if (!wxTheApp)
-    {
-        // print to console
-        va_list arg_ptr;
-        va_start(arg_ptr, pszFormat);
-        vprintf(pszFormat, arg_ptr);
-        va_end(arg_ptr);
-    }
+    va_list arg_ptr;
+    va_start(arg_ptr, pszFormat);
+    vprintf(pszFormat, arg_ptr);
+    va_end(arg_ptr);
     return 0;
 }
 
