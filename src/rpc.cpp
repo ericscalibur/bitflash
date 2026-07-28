@@ -553,6 +553,12 @@ static bool SendLine(btf_socket_t fd, const json& j)
     return true;
 }
 
+// Ceilings on what an unauthenticated peer can make the pool operator hold.
+// Stratum lines are a few hundred bytes and a real pool this size will not see
+// anything near a thousand miners.
+static const size_t MAX_STRATUM_LINE = 64 * 1024;
+static const size_t MAX_POOL_MINERS  = 1000;
+
 // Non-blocking recv: pull whatever bytes are available now into buf, then
 // return one complete line if one is ready. Three outcomes:
 //   true  -- line is filled; buf may still contain more lines
@@ -584,6 +590,16 @@ static bool RecvLine(btf_socket_t fd, std::string& buf,
         // r < 0: EAGAIN/EWOULDBLOCK -- fall through with what we have
     }
 #endif
+
+    // A peer that never sends a newline would otherwise grow this buffer for
+    // as long as it keeps writing, and it does not have to authorize first --
+    // the read happens before any of that. Stratum lines are a few hundred
+    // bytes; anything past the cap is not a slow line, it is a flood.
+    if (buf.size() > MAX_STRATUM_LINE) {
+        disconnected = true;
+        buf.clear();
+        return false;
+    }
 
     size_t pos = buf.find('\n');
     if (pos == std::string::npos) return false; // no complete line yet
@@ -668,6 +684,16 @@ static bool HandleLine(Miner* m, const std::string& rawLine,
         return true; // don't disconnect on bad JSON, just ignore the line
     }
 
+    // value() throws when the document is not an object, and again when a key
+    // is present with the wrong type -- "[1,2,3]" and {"method":1} are both
+    // valid JSON that parse cleanly and then blow up on the next two lines.
+    if (!req.is_object() || (req.contains("method") && !req["method"].is_string())) {
+        LogPrint("worker", "[worker] malformed request from %s: %.80s\n",
+                 m->address.empty() ? "(unauth)" : m->address.c_str(),
+                 rawLine.c_str());
+        return true;
+    }
+
     json        id     = req.value("id", json(nullptr));
     std::string method = req.value("method", "");
 
@@ -691,9 +717,13 @@ static bool HandleLine(Miner* m, const std::string& rawLine,
 
     // ------------------------------------------------------------------
     if (method == "mining.authorize") {
+        // is_array() matters as much as the element checks: indexing a json
+        // object with a number throws, and size() on an object returns its key
+        // count, so "params":{"a":1} would pass a bare size() test.
         auto& p = req["params"];
-        m->address = (p.size() > 0 && p[0].is_string()) ? p[0].get<std::string>() : "";
-        m->worker  = (p.size() > 1 && p[1].is_string()) ? p[1].get<std::string>() : "worker";
+        bool fArr = p.is_array();
+        m->address = (fArr && p.size() > 0 && p[0].is_string()) ? p[0].get<std::string>() : "";
+        m->worker  = (fArr && p.size() > 1 && p[1].is_string()) ? p[1].get<std::string>() : "worker";
         m->lastSeen = GetTime();
 
         // Validate address before authorising
@@ -748,9 +778,13 @@ static bool HandleLine(Miner* m, const std::string& rawLine,
         }
 
         auto& p = req["params"];
-        if (p.size() < 3) {
-            LogPrint("worker", "[worker->pool] submit bad params from %s (size=%zu)\n",
-                     m->address.c_str(), p.size());
+        // Check the shape as well as the length: a submit carrying
+        // "params":[1,2,3] would otherwise reach get<std::string>() and throw
+        // a json::type_error that nothing above catches, taking the pool down
+        // with it. Authorising costs an attacker nothing but an address.
+        if (!p.is_array() || p.size() < 3 || !p[1].is_string() || !p[2].is_string()) {
+            LogPrint("worker", "[worker->pool] submit bad params from %s\n",
+                     m->address.c_str());
             reply(false, "bad params");
             return true;
         }
@@ -1010,6 +1044,16 @@ static void PoolEventLoop()
         {
             std::lock_guard<std::mutex> lk(gReadyMutex);
             for (btf_socket_t fd : gReadyQueue) {
+                // Connecting costs nothing and every accepted socket carries a
+                // read buffer, so an unbounded miner list is an unbounded
+                // allocation for whoever runs the pool.
+                if (gMiners.size() >= MAX_POOL_MINERS) {
+                    LogPrint("worker", "[pool] refusing miner fd=%d --"
+                             " already at %zu connections\n",
+                             (int)fd, gMiners.size());
+                    sock_close(fd);
+                    continue;
+                }
                 gMiners.push_back(new Miner(fd));
                 LogPrint("worker", "[pool] miner fd=%d entered event loop"
                          " -- awaiting subscribe/authorize\n", (int)fd);
@@ -1154,9 +1198,29 @@ static void PoolEventLoop()
                     bool disc = false;
                     // Drain all complete lines buffered for this miner.
                     // HandleLine always returns true; disc signals clean disconnect.
-                    while (RecvLine(m->fd, m->readBuf, line, disc))
-                        HandleLine(m, line, roundShareCount,
-                                   roundShareTotal, blocksFoundThisSession);
+                    // ThreadRPCServer has no handler of its own, so anything
+                    // thrown here would reach the top of the thread and
+                    // terminate the whole node -- not just the pool. Every
+                    // line arrives from an unauthenticated socket.
+                    while (RecvLine(m->fd, m->readBuf, line, disc)) {
+                        try {
+                            HandleLine(m, line, roundShareCount,
+                                       roundShareTotal, blocksFoundThisSession);
+                        } catch (const std::exception& e) {
+                            LogPrint("worker", "[pool] dropping miner %s --"
+                                     " exception handling line: %s\n",
+                                     m->address.empty() ? "(unauth)" : m->address.c_str(),
+                                     e.what());
+                            disc = true;
+                            break;
+                        } catch (...) {
+                            LogPrint("worker", "[pool] dropping miner %s --"
+                                     " unknown exception handling line\n",
+                                     m->address.empty() ? "(unauth)" : m->address.c_str());
+                            disc = true;
+                            break;
+                        }
+                    }
                     if (disc) dead.push_back(m);
                 }
                 for (Miner* m : dead) {
