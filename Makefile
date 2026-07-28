@@ -7,7 +7,7 @@
 ROOT    := $(shell pwd)
 NPROC   := $(shell nproc 2>/dev/null || echo 2)
 SUDO    := $(shell [ "$$(id -u)" = "0" ] && echo "" || echo "sudo")
-VERSION := 1.1.0
+VERSION := 1.2.0
 
 # ---- Linux ----------------------------------------------------------------
 
@@ -22,10 +22,10 @@ deps-apt:
 	@if command -v apt-get >/dev/null 2>&1; then \
 	  $(SUDO) apt-get install -y build-essential cmake git pkg-config autoconf \
 	    libtool libssl-dev libdb5.3++-dev libsodium-dev nlohmann-json3-dev \
-	    libboost-system-dev libglfw3-dev libgl-dev; \
+	    libboost-system-dev libglfw3-dev libgl-dev python3-pil; \
 	else \
 	  echo "Not an apt system — install: g++ cmake git autoconf libtool"; \
-	  echo "  libssl libdb++ libsodium nlohmann-json boost glfw3 opengl"; \
+	  echo "  libssl libdb++ libsodium nlohmann-json boost glfw3 opengl python3-pil"; \
 	fi
 
 deps-secp256k1:
