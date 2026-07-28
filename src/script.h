@@ -4,6 +4,10 @@
 
 class CTransaction;
 
+// Largest byte vector a script may push onto the stack. Without a ceiling,
+// script evaluation allocates whatever the transaction asks it to.
+static const unsigned int MAX_SCRIPT_ELEMENT_SIZE = 520;
+
 enum
 {
     SIGHASH_ALL = 1,

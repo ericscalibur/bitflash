@@ -729,12 +729,16 @@ uint256 GetOrphanRoot(const CBlock* pblock)
     return pblock->GetHash();
 }
 
-int64 CBlock::GetBlockValue(int64 nFees) const
+int64 CBlock::GetBlockValue(int nHeight, int64 nFees) const
 {
     int64 nSubsidy = 50 * COIN;
 
-    // Subsidy is cut in half every 4 years
-    nSubsidy >>= (nBestHeight / 210000);
+    // Halve on the height of this block, never on nBestHeight. The subsidy a
+    // block is allowed to pay is a property of that block; deriving it from
+    // the validating node's own tip makes the answer depend on how far that
+    // node happens to have synced, so two nodes at different heights would
+    // disagree about the same block across a halving boundary.
+    nSubsidy >>= (nHeight / 210000);
 
     return nSubsidy + nFees;
 }
@@ -1011,7 +1015,7 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex)
             return false;
     }
 
-    if (vtx[0].GetValueOut() > GetBlockValue(nFees))
+    if (vtx[0].GetValueOut() > GetBlockValue(pindex->nHeight, nFees))
         return false;
 
     // Update block index on disk without changing it in memory.
@@ -1236,6 +1240,22 @@ bool CBlock::CheckBlock() const
     foreach(const CTransaction& tx, vtx)
         if (!tx.CheckTransaction())
             return error("CheckBlock() : CheckTransaction failed");
+
+    // Reject blocks carrying the same transaction twice (CVE-2012-2459).
+    //
+    // BuildMerkleTree duplicates the last hash when a level has an odd width,
+    // so appending a copy of the trailing transaction(s) yields a block with
+    // an identical merkle root -- and therefore an identical block hash -- to
+    // a legitimate one. The forgery fails validation, the hash gets recorded
+    // as bad, and the real block is then refused because it hashes the same.
+    set<uint256> setTxHashes;
+    foreach(const CTransaction& tx, vtx)
+    {
+        uint256 hashTx = tx.GetHash();
+        if (setTxHashes.count(hashTx))
+            return error("CheckBlock() : duplicate transaction in block");
+        setTxHashes.insert(hashTx);
+    }
 
     // Check proof of work matches claimed amount (memory-hard RandomX PoW)
     if (CBigNum().SetCompact(nBits) > bnProofOfWorkLimit)
@@ -2803,7 +2823,7 @@ bool BitcoinMiner()
             }
         }
         pblock->nBits = nBits;
-        pblock->vtx[0].vout[0].nValue = pblock->GetBlockValue(nFees);
+        pblock->vtx[0].vout[0].nValue = pblock->GetBlockValue(nBestHeight + 1, nFees);
         if (LogAcceptsCategory("net")) printf("\n\nRunning BitcoinMiner with %d transactions in block\n", pblock->vtx.size());
 
 

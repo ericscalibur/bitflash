@@ -182,7 +182,7 @@ static bool RebuildJob()
             }
         }
 
-        block.vtx[0].vout[0].nValue = block.GetBlockValue(0);
+        block.vtx[0].vout[0].nValue = block.GetBlockValue(pindexPrev->nHeight + 1, 0);
         block.hashPrevBlock  = pindexPrev->GetBlockHash();
         block.hashMerkleRoot = block.BuildMerkleTree();
         block.nTime = max((unsigned int)(pindexPrev->GetMedianTimePast() + 1),

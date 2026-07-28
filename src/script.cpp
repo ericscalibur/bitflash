@@ -67,6 +67,24 @@ bool EvalScript(const CScript& script, const CTransaction& txTo, unsigned int nI
         if (!script.GetOp(pc, opcode, vchPushValue))
             return false;
 
+        if (vchPushValue.size() > MAX_SCRIPT_ELEMENT_SIZE)
+            return false;
+
+        // Disabled opcodes. Checked before the fExec test, so they invalidate
+        // the script even inside a branch that is never taken.
+        //
+        // These are unbounded: OP_CAT grows a stack element without limit
+        // (<x> OP_DUP OP_CAT repeated doubles it each time, so a tiny script
+        // exhausts memory), and OP_LSHIFT shifts by an attacker-supplied
+        // amount with no ceiling. Both let any transaction take down every
+        // node that validates it. Bitcoin removed the whole group for this.
+        if (opcode == OP_CAT   || opcode == OP_SUBSTR || opcode == OP_LEFT  ||
+            opcode == OP_RIGHT || opcode == OP_INVERT || opcode == OP_AND   ||
+            opcode == OP_OR    || opcode == OP_XOR    || opcode == OP_2MUL  ||
+            opcode == OP_2DIV  || opcode == OP_MUL    || opcode == OP_DIV   ||
+            opcode == OP_MOD   || opcode == OP_LSHIFT || opcode == OP_RSHIFT)
+            return false;
+
         if (fExec && opcode <= OP_PUSHDATA4)
             stack.push_back(vchPushValue);
         else if (fExec || (OP_IF <= opcode && opcode <= OP_ENDIF))
@@ -169,9 +187,18 @@ bool EvalScript(const CScript& script, const CTransaction& txTo, unsigned int nI
 
             case OP_RETURN:
             {
-                pc = pend;
+                // Must fail the script outright, never just stop executing it.
+                //
+                // scriptSig and scriptPubKey are evaluated as one concatenated
+                // script (see VerifySignature). The 0.1.0 behaviour here was
+                // "pc = pend", which jumps past everything that follows — so a
+                // scriptSig of <OP_TRUE OP_RETURN> skipped the entire
+                // scriptPubKey, including OP_CHECKSIG, and the final
+                // CastToBool(stack.back()) saw the attacker's own OP_TRUE.
+                // That let anyone spend anyone else's outputs without a
+                // signature. Bitcoin closed this in 0.3.5.
+                return false;
             }
-            break;
 
 
             //
