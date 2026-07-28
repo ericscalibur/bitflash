@@ -390,10 +390,26 @@ void Serialize(Stream& os, const basic_string<C>& str, int, int)
 template<typename Stream, typename C>
 void Unserialize(Stream& is, basic_string<C>& str, int, int)
 {
+    // Grow in steps as the bytes actually arrive, the same way the vector
+    // unserializer below does. Resizing straight to the declared length lets
+    // nine bytes on the wire ask for a four-gigabyte allocation, and
+    // ReadCompactSize has no ceiling of its own.
+    //
+    // No network message carries a string today -- CWalletTx::mapValue is the
+    // only string field on a serialized type and RelayMessage casts it away --
+    // so this is a guard against the next one that does, not a live hole.
     unsigned int nSize = ReadCompactSize(is);
-    str.resize(nSize);
-    if (nSize != 0)
-        is.read((char*)&str[0], nSize * sizeof(str[0]));
+    str.clear();
+    unsigned int nMid = 0;
+    while (nMid < nSize)
+    {
+        nMid += 5000000 / sizeof(C);
+        if (nMid > nSize)
+            nMid = nSize;
+        unsigned int nOld = str.size();
+        str.resize(nMid);
+        is.read((char*)&str[nOld], (nMid - nOld) * sizeof(C));
+    }
 }
 
 
