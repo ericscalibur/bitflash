@@ -341,8 +341,18 @@ static void QueuePayouts(int blockHeight,
 }
 
 // Called from event loop: move matured entries to the exec queue (fast).
-// Save BEFORE moving to exec queue: if we crash between the save and SendMoney,
-// LoadPendingPayouts re-queues them from the exec-queue section of the file.
+// NOT crash-safe, despite the ordering below looking like it is.
+//
+// A matured payout is erased from gPendingPayouts, the file is rewritten
+// without it, and only then does it reach the exec queue -- which lives in
+// memory alone. SavePendingPayouts writes gPendingPayouts and nothing else;
+// there is no exec-queue section of the file to recover from. Die anywhere
+// between the rewrite and SendMoney and those miners are simply never paid,
+// with no record that they were owed anything.
+//
+// Making this safe needs the payment to be idempotent -- record the txid and
+// check the wallet for it on restart -- rather than a reordering, since
+// re-queueing blindly would double-pay whoever was already sent to.
 static void FlushMaturePayouts()
 {
     std::vector<PendingPayout> ready;
