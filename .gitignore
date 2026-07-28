@@ -3,8 +3,15 @@ src/obj/
 *.o
 *.exe
 *.a
+*.dll
 bitflash-node
 src/bitflash-node
+
+# Release artefacts (produced by 'make windows' / 'make linux')
+Bitflash-*-windows/
+Bitflash-*-windows.zip
+Bitflash-*.AppImage
+SHA256SUMS
 
 # Runtime data / logs
 debug.log
