@@ -398,6 +398,12 @@ static bool BuildSignedEvent(CNostrKey& key, int kind, const json& tags,
 //
 // Minimal WebSocket client over TLS (wss) or TCP (ws), blocking with timeout.
 //
+// Ceilings on what a relay may make this node allocate. Nostr events are
+// small -- relays themselves usually refuse anything over a few hundred KB --
+// so these are generous, and they bound an otherwise attacker-chosen size.
+static const uint64 MAX_WS_FRAME   = 1 << 20;  // 1 MiB per frame
+static const uint64 MAX_WS_MESSAGE = 4 << 20;  // 4 MiB reassembled
+
 class CWebSocket
 {
 public:
@@ -597,6 +603,14 @@ public:
                 len = 0;
                 for (int i = 0; i < 8; i++) len = (len << 8) | e[i];
             }
+            // The length is whatever the relay says it is, and these are public
+            // relays the node does not control. Unbounded, a single frame header
+            // claiming 2^40 bytes makes the node allocate until it dies -- and
+            // reassembly across continuation frames grows without limit even
+            // when each frame is small. Cap both, and refuse anything that will
+            // not survive the int narrowing ReadN takes.
+            if (len > MAX_WS_FRAME) return false;
+
             unsigned char mask[4] = {0,0,0,0};
             if (masked && !ReadN((char*)mask, 4)) return false;
 
@@ -610,6 +624,7 @@ public:
             if (opcode == 0x8) return false;                 // close
             if (opcode == 0x9) { SendPong(payload); continue; } // ping
             if (opcode == 0xA) continue;                      // pong
+            if (out.size() + payload.size() > MAX_WS_MESSAGE) return false;
             out += payload;                                   // text/continuation
             if (fin) return true;
         }
@@ -847,7 +862,7 @@ bool BtfQueryPoolAnnouncement(const std::string& poolBtfAddr, BtfPoolAnnouncemen
                     break;
                 json j;
                 try { j = json::parse(msg); } catch (...) { continue; }
-                if (!j.is_array() || j.empty()) continue;
+                if (!j.is_array() || j.empty() || !j[0].is_string()) continue;
                 string type = j[0].get<string>();
                 if (type == "EVENT" && j.size() >= 3)
                 {
@@ -957,7 +972,7 @@ static bool ResolveDescriptor(CWebSocket& ws, void* ctx, const string& btfAddr,
             break;
         json j;
         try { j = json::parse(msg); } catch (...) { continue; }
-        if (!j.is_array() || j.empty()) continue;
+        if (!j.is_array() || j.empty() || !j[0].is_string()) continue;
         string t = j[0].get<string>();
         if (t == "EVENT" && j.size() >= 3)
         {
@@ -1068,7 +1083,7 @@ bool BtfResolveMany(const std::vector<std::string>& btfAddrs,
                     break;
                 json j;
                 try { j = json::parse(msg); } catch (...) { continue; }
-                if (!j.is_array() || j.empty()) continue;
+                if (!j.is_array() || j.empty() || !j[0].is_string()) continue;
                 string t = j[0].get<string>();
                 if (t == "EVENT" && j.size() >= 3)
                 {
@@ -1144,7 +1159,7 @@ static bool SeedFromRelay(CNostrKey& key, const string& relay)
                     break;
                 json j;
                 try { j = json::parse(msg); } catch (...) { continue; }
-                if (!j.is_array() || j.empty()) continue;
+                if (!j.is_array() || j.empty() || !j[0].is_string()) continue;
                 string type = j[0].get<string>();
                 if (type == "EVENT" && j.size() >= 3)
                 {
@@ -1194,7 +1209,7 @@ static bool SeedFromRelay(CNostrKey& key, const string& relay)
                     break;
                 json j;
                 try { j = json::parse(msg); } catch (...) { continue; }
-                if (!j.is_array() || j.empty()) continue;
+                if (!j.is_array() || j.empty() || !j[0].is_string()) continue;
                 string type = j[0].get<string>();
                 if (type == "EVENT" && j.size() >= 3)
                 {
@@ -1234,7 +1249,7 @@ static bool SeedFromRelay(CNostrKey& key, const string& relay)
                     break;
                 json j;
                 try { j = json::parse(msg); } catch (...) { continue; }
-                if (!j.is_array() || j.empty()) continue;
+                if (!j.is_array() || j.empty() || !j[0].is_string()) continue;
                 string type = j[0].get<string>();
                 if (type == "EVENT" && j.size() >= 3)
                     HandlePoolAnnouncement(j[2]);
