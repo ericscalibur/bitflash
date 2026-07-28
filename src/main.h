@@ -15,6 +15,9 @@ class CWalletTx;
 class CKeyItem;
 
 static const unsigned int MAX_SIZE = 0x02000000;
+// Ceiling on transactions held waiting for a parent that has not arrived.
+// They cost a peer nothing to send and are never validated, only stored.
+static const unsigned int MAX_ORPHAN_TRANSACTIONS = 100;
 static const int64 COIN = 100000000;
 // Total Bitflash emission: identical to Bitcoin (21 million).
 // MAX_MONEY guards against the value overflow bug (CVE-2010-5139), which in
@@ -106,6 +109,9 @@ void ReacceptWalletTransactions();
 void RelayWalletTransactions();
 bool LoadBlockIndex(bool fAllowNew=true);
 void PrintBlockTree();
+void AddOrphanTx(const CDataStream& vMsg);
+void EraseOrphanTx(uint256 hash);
+void LimitOrphanTx(unsigned int nMaxOrphans);
 bool BitcoinMiner();
 void ThreadRPCServer(void* parg);  // rpc.cpp -- .btf pool server
 void GetParticipantMiningStats(uint64& sharesSent, uint64& sharesAccepted, double& hashRate);

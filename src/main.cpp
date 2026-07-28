@@ -249,6 +249,26 @@ void AddOrphanTx(const CDataStream& vMsg)
     CDataStream* pvMsg = mapOrphanTransactions[hash] = new CDataStream(vMsg);
     foreach(const CTxIn& txin, tx.vin)
         mapOrphanTransactionsByPrev.insert(make_pair(txin.prevout.hash, pvMsg));
+    LimitOrphanTx(MAX_ORPHAN_TRANSACTIONS);
+}
+
+// Orphans cost nothing to create -- a transaction naming a parent that does
+// not exist is never validated, just held -- so without a ceiling any peer can
+// grow this map until the node runs out of memory. Evict at random rather than
+// in map order, so an attacker cannot keep its own orphans resident by
+// choosing hashes that sort low.
+void LimitOrphanTx(unsigned int nMaxOrphans)
+{
+    while (mapOrphanTransactions.size() > nMaxOrphans)
+    {
+        uint256 randomhash;
+        for (int i = 0; i < 4; i++)
+            ((uint64*)&randomhash)[i] = GetRand(_UI64_MAX);
+        map<uint256, CDataStream*>::iterator it = mapOrphanTransactions.lower_bound(randomhash);
+        if (it == mapOrphanTransactions.end())
+            it = mapOrphanTransactions.begin();
+        EraseOrphanTx(it->first);
+    }
 }
 
 void EraseOrphanTx(uint256 hash)
