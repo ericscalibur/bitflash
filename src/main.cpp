@@ -1261,6 +1261,16 @@ bool CBlock::CheckBlock() const
         if (!tx.CheckTransaction())
             return error("CheckBlock() : CheckTransaction failed");
 
+    // Cap the work a block can demand. MAX_SIZE bounds the bytes, not the cost:
+    // every signature operation is an elliptic-curve verification, and at this
+    // chain's difficulty a block packed with them is affordable to mine and
+    // expensive for everyone else to reject.
+    unsigned int nSigOps = 0;
+    foreach(const CTransaction& tx, vtx)
+        nSigOps += tx.GetSigOpCount();
+    if (nSigOps > MAX_BLOCK_SIGOPS)
+        return error("CheckBlock() : out-of-bounds signature operation count");
+
     // Reject blocks carrying the same transaction twice (CVE-2012-2459).
     //
     // BuildMerkleTree duplicates the last hash when a level has an odd width,

@@ -18,6 +18,11 @@ static const unsigned int MAX_SIZE = 0x02000000;
 // Ceiling on transactions held waiting for a parent that has not arrived.
 // They cost a peer nothing to send and are never validated, only stored.
 static const unsigned int MAX_ORPHAN_TRANSACTIONS = 100;
+// Signature operations allowed in one block. Size alone does not bound what a
+// block costs to validate: every OP_CHECKSIG is an elliptic-curve verification,
+// so a block within the size limit could still hold millions of them and take
+// the network minutes of CPU to reject. Same value Bitcoin settled on.
+static const unsigned int MAX_BLOCK_SIGOPS = 20000;
 static const int64 COIN = 100000000;
 // Total Bitflash emission: identical to Bitcoin (21 million).
 // MAX_MONEY guards against the value overflow bug (CVE-2010-5139), which in
@@ -501,6 +506,16 @@ public:
     bool IsCoinBase() const
     {
         return (vin.size() == 1 && vin[0].prevout.IsNull());
+    }
+
+    unsigned int GetSigOpCount() const
+    {
+        unsigned int n = 0;
+        foreach(const CTxIn& txin, vin)
+            n += txin.scriptSig.GetSigOpCount();
+        foreach(const CTxOut& txout, vout)
+            n += txout.scriptPubKey.GetSigOpCount();
+        return n;
     }
 
     bool CheckTransaction() const

@@ -536,6 +536,29 @@ public:
     }
 
 
+    // Signature operations in this script. Each one costs every validating
+    // node an elliptic-curve verification, so blocks are capped on this count
+    // and not only on their size -- a byte of OP_CHECKSIG is far more
+    // expensive to check than a byte of anything else.
+    unsigned int GetSigOpCount() const
+    {
+        unsigned int n = 0;
+        const_iterator pc = begin();
+        opcodetype opcode;
+        vector<unsigned char> vchPushValue;
+        while (pc < end())
+        {
+            if (!GetOp(pc, opcode, vchPushValue))
+                break;
+            if (opcode == OP_CHECKSIG || opcode == OP_CHECKSIGVERIFY)
+                n++;
+            else if (opcode == OP_CHECKMULTISIG || opcode == OP_CHECKMULTISIGVERIFY)
+                n += 20;
+        }
+        return n;
+    }
+
+
     void FindAndDelete(const CScript& b)
     {
         iterator pc = begin();
