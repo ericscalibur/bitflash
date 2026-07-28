@@ -12,10 +12,16 @@
 
 #include <string>
 #include <vector>
+#include <map>
 
 // Thread entry point (signature compatible with _beginthread)
 void ThreadNostrSeed(void* parg);
 void ThreadBtfPoolAnnouncer(void* parg);
+
+// Set to true to make ThreadBtfPoolAnnouncer publish immediately instead of
+// waiting for its ~60s sleep loop (e.g. right after the operator changes pool
+// name/fee/dashboard URL in Options). The announcer clears it after publishing.
+extern volatile bool gAnnounceNow;
 
 // Public relays used for discovery. Tunable.
 extern const char* pszNostrRelays[];
@@ -56,6 +62,9 @@ struct BtfPoolAnnouncement
     }
 };
 
+// Number of .btf peers discovered from Nostr relays (includes not-yet-connected).
+int GetDiscoveredPeerCount();
+
 // Current live pool announcements discovered from Nostr relays.
 void BtfGetPoolAnnouncements(std::vector<BtfPoolAnnouncement>& out);
 
@@ -77,5 +86,22 @@ std::string BtfLocalAddress();
 // x25519 public key for the end-to-end channel.
 bool BtfResolve(const std::string& btfAddr, std::string& meetingHostPort,
                 unsigned char enc_pub[32]);
+
+// Result of resolving one .btf address via BtfResolveMany.
+struct BtfResolvedPeer
+{
+    std::string meetingHostPort;
+    unsigned char enc_pub[32];
+};
+
+// Resolve many .btf addresses at once. Batches all still-unresolved addresses
+// into a single Nostr REQ per relay (multiple "authors"), instead of opening
+// one relay connection per address like BtfResolve does. Use this whenever
+// resolving more than a handful of addresses in the same pass -- e.g. before
+// dialing several discovered peers in parallel -- to avoid hammering the
+// same few public relays with a burst of simultaneous connections. Returns
+// true if at least one address resolved; check `out` for which ones.
+bool BtfResolveMany(const std::vector<std::string>& btfAddrs,
+                     std::map<std::string, BtfResolvedPeer>& out);
 
 #endif

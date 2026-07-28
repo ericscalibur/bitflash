@@ -101,7 +101,7 @@ static SOCKET ConnectTo(const char* host, unsigned short port)
 
     // Apply a short timeout only for the connect() and initial handshake so an
     // unresponsive relay doesn't block the thread. Once the tunnel is live the
-    // timeout is cleared — a forwarding pipe must block indefinitely on recv().
+    // timeout is cleared -- a forwarding pipe must block indefinitely on recv().
 #ifdef _WIN32
     DWORD tvShort = 10000;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tvShort, sizeof(tvShort));
@@ -118,7 +118,7 @@ static SOCKET ConnectTo(const char* host, unsigned short port)
     }
     freeaddrinfo(res);
 
-    // Clear the timeout — the socket is now a live tunnel and must not
+    // Clear the timeout -- the socket is now a live tunnel and must not
     // time out when idle. recv() will block until data arrives or peer closes.
 #ifdef _WIN32
     DWORD tvOff = 0;

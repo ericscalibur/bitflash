@@ -13,6 +13,7 @@
 #include "sha.h"
 #include <atomic>
 #include <mutex>
+#include <thread>
 #include "btfaddr.h"
 #include "btftunnel.h"
 #ifndef _WIN32
@@ -73,7 +74,7 @@ bool fSoloMineTest = false; // /solomine: mine without requiring a peer (local t
 int fGenerateBitcoins;
 int64 nTransactionFee = 0;
 CAddress addrIncoming;
-int    nMineMode        = MINE_SOLO;
+int    nMineMode        = MINE_RELAY;
 string strParticipantPool;           // participant mode: pool .btf address
 string strPoolName       = "Bitflash Pool";
 string strPoolDashboardUrl;
@@ -88,11 +89,10 @@ static std::string gParticipantStatus;
 
 void SetParticipantMiningStatus(const std::string& status)
 {
+    // Updates the GUI status string only. Logging is done at each call site
+    // with full context; duplicating it here just adds noise to the log.
     std::lock_guard<std::mutex> lk(gParticipantStatusMutex);
-    if (gParticipantStatus == status)
-        return;
     gParticipantStatus = status;
-    printf("PoolParticipantMiner: status -> %s\n", status.c_str());
 }
 
 std::string GetParticipantMiningStatus()
@@ -159,7 +159,7 @@ bool AddToWallet(const CWalletTx& wtxIn)
             wtx.nTimeReceived = GetAdjustedTime();
 
         //// debug print
-        printf("AddToWallet %s  %s\n", wtxIn.GetHash().ToString().substr(0,6).c_str(), fInsertedNew ? "new" : "update");
+        if (LogAcceptsCategory("net")) printf("AddToWallet %s  %s\n", wtxIn.GetHash().ToString().substr(0,6).c_str(), fInsertedNew ? "new" : "update");
 
         if (!fInsertedNew)
         {
@@ -372,7 +372,7 @@ int CMerkleTx::SetMerkleBranch(const CBlock* pblock)
         {
             vMerkleBranch.clear();
             nIndex = -1;
-            printf("ERROR: SetMerkleBranch() : couldn't find tx in block\n");
+            if (LogAcceptsCategory("net")) printf("ERROR: SetMerkleBranch() : couldn't find tx in block\n");
             return 0;
         }
 
@@ -433,7 +433,7 @@ void CWalletTx::AddSupportingTransactions(CTxDB& txdb)
                 }
                 else
                 {
-                    printf("ERROR: AddSupportingTransactions() : unsupported transaction\n");
+                    if (LogAcceptsCategory("net")) printf("ERROR: AddSupportingTransactions() : unsupported transaction\n");
                     continue;
                 }
 
@@ -519,7 +519,7 @@ bool CTransaction::AcceptTransaction(CTxDB& txdb, bool fCheckInputs, bool* pfMis
     {
         if (ptxOld)
         {
-            printf("mapTransaction.erase(%s) replacing with new version\n", ptxOld->GetHash().ToString().c_str());
+            if (LogAcceptsCategory("net")) printf("mapTransaction.erase(%s) replacing with new version\n", ptxOld->GetHash().ToString().c_str());
             mapTransactions.erase(ptxOld->GetHash());
         }
         AddToMemoryPool();
@@ -530,7 +530,7 @@ bool CTransaction::AcceptTransaction(CTxDB& txdb, bool fCheckInputs, bool* pfMis
     if (ptxOld)
         EraseFromWallet(ptxOld->GetHash());
 
-    printf("AcceptTransaction(): accepted %s\n", hash.ToString().substr(0,6).c_str());
+    if (LogAcceptsCategory("net")) printf("AcceptTransaction(): accepted %s\n", hash.ToString().substr(0,6).c_str());
     return true;
 }
 
@@ -669,7 +669,7 @@ void CWalletTx::RelayWalletTransaction(CTxDB& txdb)
         uint256 hash = GetHash();
         if (!txdb.ContainsTx(hash))
         {
-            printf("Relaying wtx %s\n", hash.ToString().substr(0,6).c_str());
+            if (LogAcceptsCategory("net")) printf("Relaying wtx %s\n", hash.ToString().substr(0,6).c_str());
             RelayMessage(CInv(MSG_TX, hash), (CTransaction)*this);
         }
     }
@@ -683,7 +683,7 @@ void RelayWalletTransactions()
     nLastTime = GetTime();
 
     // Rebroadcast any of our txes that aren't in a block yet
-    printf("RelayWalletTransactions()\n");
+    if (LogAcceptsCategory("net")) printf("RelayWalletTransactions()\n");
     CTxDB txdb("r");
     CRITICAL_BLOCK(cs_mapWallet)
     {
@@ -764,7 +764,7 @@ unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast)
 
     // Limit adjustment step
     unsigned int nActualTimespan = pindexLast->nTime - pindexFirst->nTime;
-    printf("  nActualTimespan = %d  before bounds\n", nActualTimespan);
+    if (LogAcceptsCategory("net")) printf("  nActualTimespan = %d  before bounds\n", nActualTimespan);
     if (nActualTimespan < nTargetTimespan/4)
         nActualTimespan = nTargetTimespan/4;
     if (nActualTimespan > nTargetTimespan*4)
@@ -780,10 +780,7 @@ unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast)
         bnNew = bnProofOfWorkLimit;
 
     /// debug print
-    printf("\n\n\nGetNextWorkRequired RETARGET *****\n");
-    printf("nTargetTimespan = %d    nActualTimespan = %d\n", nTargetTimespan, nActualTimespan);
-    printf("Before: %08x  %s\n", pindexLast->nBits, CBigNum().SetCompact(pindexLast->nBits).getuint256().ToString().c_str());
-    printf("After:  %08x  %s\n", bnNew.GetCompact(), bnNew.getuint256().ToString().c_str());
+    if (LogAcceptsCategory("net")) { printf("\n\n\nGetNextWorkRequired RETARGET *****\n"); printf("nTargetTimespan = %d    nActualTimespan = %d\n", nTargetTimespan, nActualTimespan); printf("Before: %08x  %s\n", pindexLast->nBits, CBigNum().SetCompact(pindexLast->nBits).getuint256().ToString().c_str()); printf("After:  %08x  %s\n", bnNew.GetCompact(), bnNew.getuint256().ToString().c_str()); }
 
     return bnNew.GetCompact();
 }
@@ -1037,7 +1034,7 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex)
 
 bool Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
 {
-    printf("*** REORGANIZE ***\n");
+    LogPrint("net", "*** REORGANIZE ***\n");
 
     // Find the fork
     CBlockIndex* pfork = pindexBest;
@@ -1712,7 +1709,7 @@ bool ProcessMessages(CNode* pfrom)
     CDataStream& vRecv = pfrom->vRecv;
     if (vRecv.empty())
         return true;
-    printf("ProcessMessages(%d bytes)\n", vRecv.size());
+    LogPrint("net", "ProcessMessages(%d bytes)\n", vRecv.size());
 
     //
     // Message format
@@ -1730,13 +1727,13 @@ bool ProcessMessages(CNode* pfrom)
         {
             if (vRecv.size() > sizeof(CMessageHeader))
             {
-                printf("\n\nPROCESSMESSAGE MESSAGESTART NOT FOUND\n\n");
+                if (LogAcceptsCategory("net")) printf("\n\nPROCESSMESSAGE MESSAGESTART NOT FOUND\n\n");
                 vRecv.erase(vRecv.begin(), vRecv.end() - sizeof(CMessageHeader));
             }
             break;
         }
         if (pstart - vRecv.begin() > 0)
-            printf("\n\nPROCESSMESSAGE SKIPPED %d BYTES\n\n", pstart - vRecv.begin());
+            if (LogAcceptsCategory("net")) printf("\n\nPROCESSMESSAGE SKIPPED %d BYTES\n\n", pstart - vRecv.begin());
         vRecv.erase(vRecv.begin(), pstart);
 
         // Read header
@@ -1744,7 +1741,7 @@ bool ProcessMessages(CNode* pfrom)
         vRecv >> hdr;
         if (!hdr.IsValid())
         {
-            printf("\n\nPROCESSMESSAGE: ERRORS IN HEADER %s\n\n\n", hdr.GetCommand().c_str());
+            if (LogAcceptsCategory("net")) printf("\n\nPROCESSMESSAGE: ERRORS IN HEADER %s\n\n\n", hdr.GetCommand().c_str());
             continue;
         }
         string strCommand = hdr.GetCommand();
@@ -1755,7 +1752,7 @@ bool ProcessMessages(CNode* pfrom)
         {
             // Rewind and wait for rest of message
             ///// need a mechanism to give up waiting for overlong message size error
-            printf("MESSAGE-BREAK 2\n");
+            if (LogAcceptsCategory("net")) printf("MESSAGE-BREAK 2\n");
             vRecv.insert(vRecv.begin(), BEGIN(hdr), END(hdr));
             Sleep(100);
             break;
@@ -1776,7 +1773,7 @@ bool ProcessMessages(CNode* pfrom)
         }
         CATCH_PRINT_EXCEPTION("ProcessMessage()")
         if (!fRet)
-            printf("ProcessMessage(%s, %d bytes) from %s to %s FAILED\n", strCommand.c_str(), nMessageSize, pfrom->addr.ToString().c_str(), addrLocalHost.ToString().c_str());
+            if (LogAcceptsCategory("net")) printf("ProcessMessage(%s, %d bytes) from %s to %s FAILED\n", strCommand.c_str(), nMessageSize, pfrom->addr.ToString().c_str(), addrLocalHost.ToString().c_str());
     }
 
     vRecv.Compact();
@@ -1789,13 +1786,10 @@ bool ProcessMessages(CNode* pfrom)
 bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
 {
     static map<unsigned int, vector<unsigned char> > mapReuseKey;
-    printf("received: %-12s (%d bytes)  ", strCommand.c_str(), vRecv.size());
-    for (int i = 0; i < min(vRecv.size(), (unsigned int)25); i++)
-        printf("%02x ", vRecv[i] & 0xff);
-    printf("\n");
+    if (LogAcceptsCategory("net")) { printf("received: %-12s (%d bytes)  ", strCommand.c_str(), vRecv.size()); for (int i = 0; i < min(vRecv.size(), (unsigned int)25); i++) printf("%02x ", vRecv[i] & 0xff); printf("\n"); }
     if (nDropMessagesTest > 0 && GetRand(nDropMessagesTest) == 0)
     {
-        printf("dropmessages DROPPING RECV MESSAGE\n");
+        if (LogAcceptsCategory("net")) printf("dropmessages DROPPING RECV MESSAGE\n");
         return true;
     }
 
@@ -1833,7 +1827,7 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
             pfrom->PushMessage("getblocks", CBlockLocator(pindexBest), uint256(0));
         }
 
-        printf("version addrMe = %s\n", addrMe.ToString().c_str());
+        if (LogAcceptsCategory("net")) printf("version addrMe = %s\n", addrMe.ToString().c_str());
     }
 
 
@@ -1841,30 +1835,6 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
     {
         // Must have a version message before anything else
         return false;
-    }
-
-
-    else if (strCommand == "addr")
-    {
-        vector<CAddress> vAddr;
-        vRecv >> vAddr;
-
-        // Store the new addresses
-        CAddrDB addrdb;
-        foreach(const CAddress& addr, vAddr)
-        {
-            if (fShutdown)
-                return true;
-            if (AddAddress(addrdb, addr))
-            {
-                // Put on lists to send to other nodes
-                pfrom->setAddrKnown.insert(addr);
-                CRITICAL_BLOCK(cs_vNodes)
-                    foreach(CNode* pnode, vNodes)
-                        if (!pnode->setAddrKnown.count(addr))
-                            pnode->vAddrToSend.push_back(addr);
-            }
-        }
     }
 
 
@@ -1881,7 +1851,7 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
             pfrom->AddInventoryKnown(inv);
 
             bool fAlreadyHave = AlreadyHave(txdb, inv);
-            printf("  got inventory: %s  %s\n", inv.ToString().c_str(), fAlreadyHave ? "have" : "new");
+            if (LogAcceptsCategory("net")) printf("  got inventory: %s  %s\n", inv.ToString().c_str(), fAlreadyHave ? "have" : "new");
 
             if (!fAlreadyHave)
                 pfrom->AskFor(inv);
@@ -1900,7 +1870,7 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         {
             if (fShutdown)
                 return true;
-            printf("received getdata for: %s\n", inv.ToString().c_str());
+            if (LogAcceptsCategory("net")) printf("received getdata for: %s\n", inv.ToString().c_str());
 
             if (inv.type == MSG_BLOCK)
             {
@@ -1940,12 +1910,12 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         // Send the rest of the chain
         if (pindex)
             pindex = pindex->pnext;
-        printf("getblocks %d to %s\n", (pindex ? pindex->nHeight : -1), hashStop.ToString().substr(0,14).c_str());
+        if (LogAcceptsCategory("net")) printf("getblocks %d to %s\n", (pindex ? pindex->nHeight : -1), hashStop.ToString().substr(0,14).c_str());
         for (; pindex; pindex = pindex->pnext)
         {
             if (pindex->GetBlockHash() == hashStop)
             {
-                printf("  getblocks stopping at %d %s\n", pindex->nHeight, pindex->GetBlockHash().ToString().substr(0,14).c_str());
+                if (LogAcceptsCategory("net")) printf("  getblocks stopping at %d %s\n", pindex->nHeight, pindex->GetBlockHash().ToString().substr(0,14).c_str());
                 break;
             }
 
@@ -1997,7 +1967,7 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
 
                     if (tx.AcceptTransaction(true))
                     {
-                        printf("   accepted orphan tx %s\n", inv.hash.ToString().substr(0,6).c_str());
+                        if (LogAcceptsCategory("net")) printf("   accepted orphan tx %s\n", inv.hash.ToString().substr(0,6).c_str());
                         AddToWalletIfMine(tx, NULL);
                         RelayMessage(inv, vMsg);
                         mapAlreadyAskedFor.erase(inv);
@@ -2011,7 +1981,7 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         }
         else if (fMissingInputs)
         {
-            printf("storing orphan tx %s\n", inv.hash.ToString().substr(0,6).c_str());
+            if (LogAcceptsCategory("net")) printf("storing orphan tx %s\n", inv.hash.ToString().substr(0,6).c_str());
             AddOrphanTx(vMsg);
         }
     }
@@ -2041,32 +2011,13 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         vRecv >> *pblock;
 
         //// debug print
-        printf("received block:\n"); pblock->print();
+        if (LogAcceptsCategory("net")) { printf("received block:\n"); pblock->print(); }
 
         CInv inv(MSG_BLOCK, pblock->GetHash());
         pfrom->AddInventoryKnown(inv);
 
         if (ProcessBlock(pfrom, pblock.release()))
             mapAlreadyAskedFor.erase(inv);
-    }
-
-
-    else if (strCommand == "getaddr")
-    {
-        pfrom->vAddrToSend.clear();
-        //// need to expand the time range if not enough found
-        int64 nSince = GetAdjustedTime() - 60 * 60; // in the last hour
-        CRITICAL_BLOCK(cs_mapAddresses)
-        {
-            foreach(const PAIRTYPE(vector<unsigned char>, CAddress)& item, mapAddresses)
-            {
-                if (fShutdown)
-                    return true;
-                const CAddress& addr = item.second;
-                if (addr.nTime > nSince)
-                    pfrom->vAddrToSend.push_back(addr);
-            }
-        }
     }
 
 
@@ -2134,12 +2085,12 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
     else
     {
         // Ignore unknown commands for extensibility
-        printf("ProcessMessage(%s) : Ignored unknown message\n", strCommand.c_str());
+        if (LogAcceptsCategory("net")) printf("ProcessMessage(%s) : Ignored unknown message\n", strCommand.c_str());
     }
 
 
     if (!vRecv.empty())
-        printf("ProcessMessage(%s) : %d extra bytes\n", strCommand.c_str(), vRecv.size());
+        if (LogAcceptsCategory("net")) printf("ProcessMessage(%s) : %d extra bytes\n", strCommand.c_str(), vRecv.size());
 
     return true;
 }
@@ -2160,19 +2111,6 @@ bool SendMessages(CNode* pto)
         // Don't send anything until we get their version message
         if (pto->nVersion == 0)
             return true;
-
-
-        //
-        // Message: addr
-        //
-        vector<CAddress> vAddrToSend;
-        vAddrToSend.reserve(pto->vAddrToSend.size());
-        foreach(const CAddress& addr, pto->vAddrToSend)
-            if (!pto->setAddrKnown.count(addr))
-                vAddrToSend.push_back(addr);
-        pto->vAddrToSend.clear();
-        if (!vAddrToSend.empty())
-            pto->PushMessage("addr", vAddrToSend);
 
 
         //
@@ -2204,7 +2142,7 @@ bool SendMessages(CNode* pto)
         while (!pto->mapAskFor.empty() && (*pto->mapAskFor.begin()).first <= nNow)
         {
             const CInv& inv = (*pto->mapAskFor.begin()).second;
-            printf("sending getdata: %s\n", inv.ToString().c_str());
+            if (LogAcceptsCategory("net")) printf("sending getdata: %s\n", inv.ToString().c_str());
             if (!AlreadyHave(txdb, inv))
                 vAskFor.push_back(inv);
             pto->mapAskFor.erase(pto->mapAskFor.begin());
@@ -2280,9 +2218,17 @@ void BlockSHA256(const void* pin, unsigned int nBlocks, void* pout)
 
 
 // ---------------------------------------------------------------------------
-// Participant pool miner — connects to an external Stratum server, receives
+// Participant pool miner -- connects to an external Stratum server, receives
 // RandomX jobs, hashes with the local CPU, and submits shares.
 // Called from BitcoinMiner() when nMineMode == MINE_PARTICIPANT.
+// ---------------------------------------------------------------------------
+
+using json = nlohmann::json;
+
+
+// ---------------------------------------------------------------------------
+// Participant miner -- connects to a pool over a .btf tunnel, runs Stratum,
+// hashes with RandomX, submits shares. Called from BitcoinMiner().
 // ---------------------------------------------------------------------------
 
 using json = nlohmann::json;
@@ -2300,10 +2246,10 @@ static std::vector<unsigned char> FromHexStr(const std::string& s)
 {
     std::vector<unsigned char> v;
     for (size_t i = 0; i+1 < s.size(); i += 2) {
-        auto h=[](char c)->int{
-            if(c>='0'&&c<='9')return c-'0';
-            if(c>='a'&&c<='f')return c-'a'+10;
-            if(c>='A'&&c<='F')return c-'A'+10;
+        auto h = [](char c)->int{
+            if(c>='0'&&c<='9') return c-'0';
+            if(c>='a'&&c<='f') return c-'a'+10;
+            if(c>='A'&&c<='F') return c-'A'+10;
             return 0;
         };
         v.push_back((unsigned char)((h(s[i])<<4)|h(s[i+1])));
@@ -2313,14 +2259,13 @@ static std::vector<unsigned char> FromHexStr(const std::string& s)
 
 static void UpdateParticipantHashRate(uint64 hashesSinceSample, int64 sampleStart)
 {
-    int64 now = GetTime();
-    int64 elapsed = now - sampleStart;
-    if (elapsed <= 0)
-        elapsed = 1;
-    double rate = (double)hashesSinceSample / (double)elapsed;
-    gParticipantHashRateX1000.store((uint64)(rate * 1000.0));
+    int64 elapsed = GetTime() - sampleStart;
+    if (elapsed <= 0) elapsed = 1;
+    gParticipantHashRateX1000.store(
+        (uint64)((double)hashesSinceSample / (double)elapsed * 1000.0));
 }
 
+// Blocking send of a JSON line to the pool.
 static bool StratumSendLine(SOCKET s, const json& j)
 {
     std::string line = j.dump() + "\n";
@@ -2333,38 +2278,59 @@ static bool StratumSendLine(SOCKET s, const json& j)
     return true;
 }
 
-static bool StratumRecvLine(SOCKET s, std::string& buf, std::string& line)
+// Non-blocking recv into carry buffer. Returns true + fills line when a
+// complete newline-terminated message is ready. Returns false in two cases:
+//   disconnected=true  -- socket closed by peer; caller must stop
+//   disconnected=false -- no complete line yet; caller should select() and retry
+static bool StratumRecvLine(SOCKET s, std::string& buf,
+                            std::string& line, bool& disconnected)
 {
-    while (true) {
-        size_t pos = buf.find('\n');
-        if (pos != std::string::npos) {
-            line = buf.substr(0, pos);
-            if (!line.empty() && line.back()=='\r') line.pop_back();
-            buf = buf.substr(pos+1);
-            return true;
-        }
-        char tmp[4096];
-        int r = recv(s, tmp, sizeof(tmp)-1, 0);
-        if (r <= 0) return false;
-        tmp[r] = 0;
-        buf += tmp;
+    disconnected = false;
+    char tmp[4096];
+#ifdef _WIN32
+    u_long avail = 0;
+    ioctlsocket(s, FIONREAD, &avail);
+    if (avail > 0) {
+        int r = recv(s, tmp, (int)std::min((u_long)(sizeof(tmp)-1), avail), 0);
+        if (r > 0)       { tmp[r] = 0; buf += tmp; }
+        else if (r == 0) { disconnected = true; return false; }
     }
+#else
+    {
+        int r = recv(s, tmp, sizeof(tmp)-1, MSG_DONTWAIT);
+        if (r > 0)       { tmp[r] = 0; buf += tmp; }
+        else if (r == 0) { disconnected = true; return false; }
+        // r < 0: EAGAIN -- no data right now
+    }
+#endif
+    size_t pos = buf.find('\n');
+    if (pos == std::string::npos) return false;
+    line = buf.substr(0, pos);
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    buf = buf.substr(pos + 1);
+    return true;
 }
+
+// How long to wait for a mining.notify after authorize before giving up
+static const int64 STUCK_NO_JOB_TIMEOUT_SECS = 120;
 
 static bool PoolParticipantMiner()
 {
-    printf("PoolParticipantMiner: connecting to %s\n", strParticipantPool.c_str());
-    SetParticipantMiningStatus("resolving pool address");
-
+    // ------------------------------------------------------------------
+    // Step 1: resolve .btf address -> meeting node
+    // ------------------------------------------------------------------
     if (strParticipantPool.empty()) {
-        printf("PoolParticipantMiner: no pool selected\n");
+        LogPrint("worker", "[worker] no pool selected\n");
         SetParticipantMiningStatus("no pool selected");
         return false;
     }
 
+    LogPrint("worker", "[worker] connecting to pool %s\n", strParticipantPool.c_str());
+    SetParticipantMiningStatus("resolving pool address");
+
     unsigned char target_pubkey[32];
     if (!btf::ParseAddress(strParticipantPool, target_pubkey)) {
-        printf("PoolParticipantMiner: invalid .btf address %s\n", strParticipantPool.c_str());
+        LogPrint("worker", "[worker] invalid .btf address: %s\n", strParticipantPool.c_str());
         SetParticipantMiningStatus("invalid pool address");
         return false;
     }
@@ -2372,35 +2338,48 @@ static bool PoolParticipantMiner()
     std::string meetingHostPort;
     unsigned char service_enc_pub[32];
     if (!BtfResolve(strParticipantPool, meetingHostPort, service_enc_pub)) {
-        printf("PoolParticipantMiner: failed to resolve %s\n", strParticipantPool.c_str());
+        LogPrint("worker", "[worker] failed to resolve pool %s"
+                 " (no Nostr descriptor found -- pool may be offline or relays down)\n",
+                 strParticipantPool.c_str());
         SetParticipantMiningStatus("failed to resolve pool");
         return false;
     }
+    LogPrint("worker", "[worker] pool resolved to meeting node %s\n", meetingHostPort.c_str());
 
     size_t colon = meetingHostPort.rfind(':');
     if (colon == std::string::npos) {
-        printf("PoolParticipantMiner: bad meeting node %s\n", meetingHostPort.c_str());
+        LogPrint("worker", "[worker] bad meeting node format '%s'\n", meetingHostPort.c_str());
         SetParticipantMiningStatus("bad pool endpoint");
         return false;
     }
     std::string host = meetingHostPort.substr(0, colon);
     int port = atoi(meetingHostPort.substr(colon + 1).c_str());
     if (port <= 0 || port > 65535) {
-        printf("PoolParticipantMiner: bad meeting port %d\n", port);
+        LogPrint("worker", "[worker] bad meeting port %d in '%s'\n",
+                 port, meetingHostPort.c_str());
         SetParticipantMiningStatus("bad pool port");
         return false;
     }
 
-    btf_socket_t s = btf::BtfClientTunnel(host.c_str(), (unsigned short)port, target_pubkey, service_enc_pub);
+    // ------------------------------------------------------------------
+    // Step 2: open encrypted tunnel to pool
+    // ------------------------------------------------------------------
+    SetParticipantMiningStatus("opening tunnel");
+    btf_socket_t s = btf::BtfClientTunnel(host.c_str(), (unsigned short)port,
+                                           target_pubkey, service_enc_pub);
     if (s == INVALID_SOCKET) {
-        printf("PoolParticipantMiner: tunnel connect failed via %s\n", meetingHostPort.c_str());
+        LogPrint("worker", "[worker] tunnel connect FAILED via %s"
+                 " (relay unreachable or pool not listening)\n",
+                 meetingHostPort.c_str());
         SetParticipantMiningStatus("tunnel connect failed");
         return false;
     }
-    printf("PoolParticipantMiner: connected via %s\n", meetingHostPort.c_str());
-    SetParticipantMiningStatus("tunnel connected");
+    LogPrint("worker", "[worker] tunnel open via %s\n", meetingHostPort.c_str());
+    SetParticipantMiningStatus("tunnel open");
 
-    // Use our wallet address as mining username so payouts go to our wallet
+    // ------------------------------------------------------------------
+    // Step 3: determine our payout address (mining username)
+    // ------------------------------------------------------------------
     std::string username;
     {
         std::vector<unsigned char> vchPubKey;
@@ -2408,102 +2387,260 @@ static bool PoolParticipantMiner()
             username = PubKeyToAddress(vchPubKey);
     }
     if (username.empty()) username = BtfLocalAddress();
-    if (username.empty()) username = "unknown";
+    if (username.empty()) {
+        LogPrint("worker", "[worker] WARNING: could not determine wallet address"
+                 " -- shares will not pay out\n");
+        username = "unknown";
+    }
+    LogPrint("worker", "[worker] payout address: %s\n", username.c_str());
 
+    // ------------------------------------------------------------------
+    // Step 4: build the fast (~2 GB dataset) RandomX mode if not already
+    // built, then start our VM. Without this, RandomXCreateMinerVM() falls
+    // back to "light" mode (cache only) forever, which is dramatically
+    // slower per hash than fast mode -- it recomputes dataset items on the
+    // fly for every single hash instead of a direct memory lookup. That
+    // alone can turn a "few seconds per share" pool into "many minutes per
+    // share" regardless of how easy the share target is.
+    //
+    // This MUST happen before we send mining.subscribe/authorize, not
+    // after: it's a synchronous, single-threaded-per-call build that can
+    // take anywhere from several seconds to a couple of minutes depending
+    // on core count. If it runs after the handshake messages are sent,
+    // the pool's replies (subscribe ack, authorize ack, set_difficulty,
+    // and the first job) all land in the OS socket buffer while we're
+    // not reading -- nothing is lost, but we sit there looking (and
+    // logging) like we're "stuck waiting for pool response" for the
+    // entire build duration, when really we're just not listening yet.
+    // Building the dataset first means that by the time we say
+    // "subscribing", we're genuinely ready to read the reply the instant
+    // it arrives.
+    // ------------------------------------------------------------------
+    if (!RandomXFastReady()) {
+        SetParticipantMiningStatus("building RandomX dataset (~2GB, one-time)");
+        unsigned int nThreads = std::thread::hardware_concurrency();
+        RandomXInitDataset(nThreads > 0 ? (int)nThreads : 1);
+    }
+    void* rxvm = RandomXCreateMinerVM();
+    if (!rxvm) {
+        LogPrint("worker", "[worker] failed to create RandomX VM\n");
+        SetParticipantMiningStatus("RandomX init failed");
+        closesocket(s); return false;
+    }
+    LogPrint("worker", "[worker] RandomX VM ready (%s)\n",
+             RandomXFastReady() ? "fast 2GB" : "light 256MB");
+
+    // ------------------------------------------------------------------
+    // Step 5: Stratum subscribe + authorize. The socket is read from
+    // immediately after this, in the main loop below, so nothing sits
+    // unread behind a blocking dataset build anymore.
+    // ------------------------------------------------------------------
     std::string buf;
     int msgId = 1;
     std::set<int> pendingSubmitIds;
 
-    // Subscribe
     SetParticipantMiningStatus("subscribing");
-    if (!StratumSendLine(s, json{{"id",msgId++},{"method","mining.subscribe"},{"params",json::array()}}))
-        { SetParticipantMiningStatus("subscribe failed"); closesocket(s); return false; }
+    LogPrint("worker", "[worker->pool] sending mining.subscribe\n");
+    if (!StratumSendLine(s, json{{"id",msgId++},{"method","mining.subscribe"},
+                                 {"params",json::array()}})) {
+        LogPrint("worker", "[worker] subscribe send FAILED -- pool dropped connection\n");
+        SetParticipantMiningStatus("subscribe send failed");
+        RandomXDestroyMinerVM(rxvm);
+        closesocket(s); return false;
+    }
 
-    // Authorize
     SetParticipantMiningStatus("authorizing");
+    LogPrint("worker", "[worker->pool] sending mining.authorize as %s\n", username.c_str());
     if (!StratumSendLine(s, json{{"id",msgId++},{"method","mining.authorize"},
-                                 {"params",json::array({username,"x"})}}))
-        { SetParticipantMiningStatus("authorize failed"); closesocket(s); return false; }
+                                 {"params",json::array({username,"x"})}})) {
+        LogPrint("worker", "[worker] authorize send FAILED -- pool dropped connection\n");
+        SetParticipantMiningStatus("authorize send failed");
+        RandomXDestroyMinerVM(rxvm);
+        closesocket(s); return false;
+    }
 
-    // Job state
+    // ------------------------------------------------------------------
+    // Step 6: main loop -- receive messages, hash, submit shares
+    // ------------------------------------------------------------------
     std::string jobId;
-    unsigned char header[80];
+    unsigned char header[80] = {};
     uint256 target;
-    bool haveJob = false;
+    double currentDifficulty = 1.0; // updated by mining.set_difficulty from pool
+    bool haveJob         = false;
     bool gotSubscribeAck = false;
     bool gotAuthorizeAck = false;
-    int64 authWaitStart = 0;
-    unsigned int nNonce = 1;
-    uint64 hashesSinceSample = 0;
-    int64 sampleStart = GetTime();
+    int64 authWaitStart  = 0;
+    int64 lastStuckLog   = 0;
+    unsigned int nNonce  = 1;
+    uint64 hashesSinceSample  = 0;
+    uint64 sessionSharesSent  = 0; // this connection only
+    uint64 sessionSharesAccepted = 0;
+    int64  sampleStart       = GetTime();
 
-    void* rxvm = RandomXCreateMinerVM();
-    if (!rxvm) { SetParticipantMiningStatus("failed to start RandomX miner"); closesocket(s); return false; }
-    printf("PoolParticipantMiner: RandomX VM ready (%s)\n",
-           RandomXFastReady() ? "fast 2GB" : "light 256MB");
-    SetParticipantMiningStatus("authorized; asking pool for work");
+    SetParticipantMiningStatus("waiting for pool response");
 
     while (fGenerateBitcoins && nMineMode == MINE_PARTICIPANT && !fShutdown)
     {
-        // Non-blocking receive check
+        // -- Receive: check buffer first, then select --
         {
-            fd_set fds; FD_ZERO(&fds); FD_SET(s, &fds);
-            struct timeval tv={0,50000}; // 50ms
-            if (select((int)s+1, &fds, NULL, NULL, &tv) > 0) {
+            bool haveBuffered = buf.find('\n') != std::string::npos;
+            bool readable     = false;
+            if (!haveBuffered) {
+                fd_set fds; FD_ZERO(&fds); FD_SET(s, &fds);
+                struct timeval tv = {0, 50000}; // 50ms
+                readable = select((int)s+1, &fds, NULL, NULL, &tv) > 0;
+            }
+
+            if (haveBuffered || readable) {
                 std::string line;
-                if (!StratumRecvLine(s, buf, line)) break;
-                try {
-                    json msg = json::parse(line);
-                    if (msg.contains("id") && msg["id"].is_number_integer() && msg.contains("result")) {
-                        int id = msg["id"].get<int>();
-                        if (id == 1 && msg["result"].is_boolean() && msg["result"].get<bool>()) {
-                            gotSubscribeAck = true;
-                            SetParticipantMiningStatus("subscribed; authorizing");
-                        } else if (id == 2 && msg["result"].is_boolean()) {
-                            gotAuthorizeAck = msg["result"].get<bool>();
-                            authWaitStart = GetTime();
-                            SetParticipantMiningStatus(gotAuthorizeAck ? "authorized; asking pool for work" : "authorization rejected");
+                bool disc = false;
+                while (StratumRecvLine(s, buf, line, disc)) {
+                    json msg;
+                    try { msg = json::parse(line); } catch (...) {
+                        LogPrint("worker", "[pool->worker] JSON parse error: %.80s\n",
+                                 line.c_str());
+                        continue;
+                    }
+
+                    // -- Response to our subscribe (id=1) --
+                    if (msg.contains("id") && msg["id"].is_number_integer()
+                        && msg["id"].get<int>() == 1
+                        && msg.contains("result") && !msg["result"].is_null()) {
+                        gotSubscribeAck = true;
+                        LogPrint("worker", "[pool->worker] subscribe ack received\n");
+                        SetParticipantMiningStatus("subscribed; waiting for authorize ack");
+                    }
+
+                    // -- Response to our authorize (id=2) --
+                    else if (msg.contains("id") && msg["id"].is_number_integer()
+                             && msg["id"].get<int>() == 2
+                             && msg.contains("result")) {
+                        bool ok = msg["result"].is_boolean() && msg["result"].get<bool>();
+                        authWaitStart = GetTime();
+                        if (ok) {
+                            gotAuthorizeAck = true;
+                            LogPrint("worker", "[pool->worker] authorize OK -- waiting for job\n");
+                            SetParticipantMiningStatus("authorized; waiting for job");
+                        } else {
+                            std::string reason = msg.value("error", json("unspecified")).is_string()
+                                ? msg["error"].get<std::string>() : "unspecified";
+                            LogPrint("worker", "[pool->worker] authorize REJECTED: %s\n",
+                                     reason.c_str());
+                            SetParticipantMiningStatus("authorization rejected");
+                            // Don't break -- pool might still send a job (some pools
+                            // reject bad addresses but still send work)
                         }
-                        if (pendingSubmitIds.erase(id) > 0) {
-                            if (msg["result"].is_boolean() && msg["result"].get<bool>()) {
+                    }
+
+                    // -- Share submission response --
+                    else if (msg.contains("id") && msg["id"].is_number_integer()) {
+                        int rid = msg["id"].get<int>();
+                        if (pendingSubmitIds.erase(rid) > 0) {
+                            bool accepted = msg.contains("result")
+                                         && msg["result"].is_boolean()
+                                         && msg["result"].get<bool>();
+                            if (accepted) {
                                 gParticipantSharesAccepted.fetch_add(1);
+                                sessionSharesAccepted++;
+                                LogPrint("worker", "[pool->worker] share id=%d ACCEPTED\n", rid);
                                 SetParticipantMiningStatus("share accepted");
                             } else {
-                                SetParticipantMiningStatus("share rejected");
+                                std::string reason = (msg.contains("error")
+                                    && msg["error"].is_string())
+                                    ? msg["error"].get<std::string>() : "unspecified";
+                                LogPrint("worker", "[pool->worker] share id=%d REJECTED: %s\n",
+                                         rid, reason.c_str());
+                                SetParticipantMiningStatus("share rejected: " + reason);
                             }
                         }
                     }
-                    std::string method = msg.value("method","");
-                    if (method == "mining.notify") {
-                        auto& p = msg["params"];
-                        jobId = p[0].get<std::string>();
-                        // p[1] = full 80-byte header hex
-                        auto hdrBytes = FromHexStr(p[1].get<std::string>());
-                        if (hdrBytes.size() >= 80)
-                            memcpy(header, hdrBytes.data(), 80);
-                        // p[3] = share target hex (little-endian uint256)
-                        auto tgtBytes = FromHexStr(p[3].get<std::string>());
-                        if (tgtBytes.size() >= 32)
-                            memcpy(&target, tgtBytes.data(), 32);
-                        haveJob = true;
-                        nNonce = 1;
-                        SetParticipantMiningStatus("job received; hashing");
-                        printf("PoolParticipantMiner: new job %s\n", jobId.c_str());
-                    } else if (method == "mining.set_difficulty") {
-                        // acknowledged, we use the target from notify
+
+                    // -- Server notification --
+                    else {
+                        std::string method = msg.value("method", "");
+
+                        if (method == "mining.notify") {
+                            auto& p = msg["params"];
+                            if (!p.is_array() || p.size() < 4) {
+                                LogPrint("worker", "[pool->worker] malformed mining.notify"
+                                         " (params size=%zu)\n", p.is_array() ? p.size() : 0);
+                            } else {
+                                std::string newJobId = p[0].get<std::string>();
+                                auto hdrBytes = FromHexStr(p[1].get<std::string>());
+                                auto tgtBytes = FromHexStr(p[3].get<std::string>());
+
+                                if (hdrBytes.size() < 80) {
+                                    LogPrint("worker", "[pool->worker] mining.notify:"
+                                             " header too short (%zu bytes)\n",
+                                             hdrBytes.size());
+                                } else if (tgtBytes.size() < 32) {
+                                    LogPrint("worker", "[pool->worker] mining.notify:"
+                                             " target too short (%zu bytes)\n",
+                                             tgtBytes.size());
+                                } else {
+                                    jobId = newJobId;
+                                    memcpy(header, hdrBytes.data(), 80);
+                                    memcpy(&target, tgtBytes.data(), 32);
+                                    haveJob = true;
+                                    nNonce  = 1;
+                                    LogPrint("worker", "[pool->worker] new job %s received\n",
+                                             jobId.c_str());
+                                    SetParticipantMiningStatus("hashing job " + jobId);
+                                }
+                            }
+                        } else if (method == "mining.set_difficulty") {
+                            // Pool adjusts our share difficulty via vardiff.
+                            // Apply it immediately so we start hashing at the new target.
+                            if (msg.contains("params") && msg["params"].is_array()
+                                && msg["params"].size() > 0
+                                && msg["params"][0].is_number()) {
+                                double newDiff = msg["params"][0].get<double>();
+                                if (newDiff > 0.0) {
+                                    bool changed = (newDiff != currentDifficulty);
+                                    currentDifficulty = newDiff;
+                                    LogPrint("worker", "[pool->worker] set_difficulty %.6f%s\n",
+                                             newDiff, changed ? " (updated)" : " (initial)");
+                                }
+                            } else {
+                                LogPrint("worker", "[pool->worker] set_difficulty"
+                                         " received (no valid params)\n");
+                            }
+                        } else if (!method.empty()) {
+                            LogPrint("worker", "[pool->worker] unknown server method: %s\n",
+                                     method.c_str());
+                        }
                     }
-                } catch(...) {}
+                }
+
+                if (disc) {
+                    LogPrint("worker", "[worker] pool closed the connection"
+                             " (gotSubscribeAck=%d gotAuthorizeAck=%d haveJob=%d)\n",
+                             gotSubscribeAck, gotAuthorizeAck, haveJob);
+                    break;
+                }
             }
         }
 
-        if (gotAuthorizeAck && !haveJob && authWaitStart > 0 && GetTime() - authWaitStart > 10) {
-            SetParticipantMiningStatus("authorized; waiting for pool notify");
-            authWaitStart = 0;
+        // -- Stuck watchdog: authorized but no job arriving --
+        if (gotAuthorizeAck && !haveJob && authWaitStart > 0) {
+            int64 waited = GetTime() - authWaitStart;
+            if (waited > 10 && GetTime() - lastStuckLog >= 15) {
+                LogPrint("worker", "[worker] authorized but no job after %llds"
+                         " -- pool tunnel is live, waiting on mining.notify\n",
+                         (long long)waited);
+                lastStuckLog = GetTime();
+            }
+            if (waited > STUCK_NO_JOB_TIMEOUT_SECS) {
+                LogPrint("worker", "[worker] no job received after %llds -- disconnecting"
+                         " and reconnecting\n", (long long)STUCK_NO_JOB_TIMEOUT_SECS);
+                SetParticipantMiningStatus("timeout waiting for job; reconnecting");
+                break;
+            }
         }
 
         if (!haveJob) { Sleep(100); continue; }
 
-        // Hash one nonce
+        // -- Hash one nonce --
         memcpy(header+76, &nNonce, 4);
         uint256 hash = RandomXHashWithVM(rxvm, header, 80);
         hashesSinceSample++;
@@ -2512,38 +2649,59 @@ static bool PoolParticipantMiner()
             UpdateParticipantHashRate(hashesSinceSample, sampleStart);
 
         if (hash <= target) {
-            printf("PoolParticipantMiner: share found! nonce=%u\n", nNonce);
+            LogPrint("worker", "[worker] share found! nonce=%u job=%s difficulty=%.4f\n",
+                     nNonce, jobId.c_str(), currentDifficulty);
             SetParticipantMiningStatus("share found; submitting");
             int submitId = msgId++;
             pendingSubmitIds.insert(submitId);
             gParticipantSharesSent.fetch_add(1);
+            sessionSharesSent++;
             json submit = {{"id",submitId},{"method","mining.submit"},
-                           {"params",json::array({username, jobId,
-                                                  ToHexStr(&nNonce,4)})}};
-            if (!StratumSendLine(s, submit)) break;
+                           {"params",json::array({username, jobId, ToHexStr(&nNonce,4)})}};
+            if (!StratumSendLine(s, submit)) {
+                LogPrint("worker", "[worker] share submit send FAILED"
+                         " -- pool connection lost\n");
+                break;
+            }
         }
 
         nNonce++;
-        if (nNonce == 0) { haveJob = false; } // exhausted, wait for new job
+        if (nNonce == 0) {
+            LogPrint("worker", "[worker] nonce space exhausted for job %s"
+                     " -- waiting for new job\n", jobId.c_str());
+            haveJob = false;
+        }
     }
 
+    // ------------------------------------------------------------------
+    // Cleanup
+    // ------------------------------------------------------------------
     RandomXDestroyMinerVM(rxvm);
     closesocket(s);
     UpdateParticipantHashRate(hashesSinceSample, sampleStart);
-    SetParticipantMiningStatus("participant miner stopped");
-    printf("PoolParticipantMiner: disconnected\n");
+    SetParticipantMiningStatus("disconnected");
+    LogPrint("worker", "[worker] disconnected from pool"
+             " (hashes this session: %llu, shares sent: %llu, accepted: %llu)\n",
+             (unsigned long long)hashesSinceSample,
+             (unsigned long long)sessionSharesSent,
+             (unsigned long long)sessionSharesAccepted);
     return true;
 }
 
 bool BitcoinMiner()
 {
+    // Relay mode: never mines, just relays/syncs. (Shouldn't normally get here
+    // since the GUI hides Start Mining for Relay, but guard it regardless.)
+    if (nMineMode == MINE_RELAY)
+        return true;
+
     // Participant mode: connect to external pool instead of mining solo/operator
     if (nMineMode == MINE_PARTICIPANT)
     {
         while (fGenerateBitcoins && nMineMode == MINE_PARTICIPANT && !fShutdown) {
             PoolParticipantMiner();
             if (fGenerateBitcoins && nMineMode == MINE_PARTICIPANT && !fShutdown) {
-                printf("PoolParticipantMiner: reconnecting in 10s\n");
+                LogPrint("worker", "PoolParticipantMiner: reconnecting in 10s\n");
                 for (int i = 0; i < 10 && !fShutdown; i++) Sleep(1000);
             }
         }
@@ -2554,8 +2712,15 @@ bool BitcoinMiner()
     if (nMineMode == MINE_OPERATOR)
         return true;
 
-    printf("BitcoinMiner started\n");
+    LogPrint("net", "BitcoinMiner started\n");
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+
+    // Build the fast (~2 GB dataset) RandomX mode once, up front, so we're
+    // not stuck mining in the much slower light/cache-only mode forever.
+    if (!RandomXFastReady()) {
+        unsigned int nThreads = std::thread::hardware_concurrency();
+        RandomXInitDataset(nThreads > 0 ? (int)nThreads : 1);
+    }
 
     CKey key;
     key.MakeNewKey();
@@ -2639,7 +2804,7 @@ bool BitcoinMiner()
         }
         pblock->nBits = nBits;
         pblock->vtx[0].vout[0].nValue = pblock->GetBlockValue(nFees);
-        printf("\n\nRunning BitcoinMiner with %d transactions in block\n", pblock->vtx.size());
+        if (LogAcceptsCategory("net")) printf("\n\nRunning BitcoinMiner with %d transactions in block\n", pblock->vtx.size());
 
 
         //
@@ -2658,11 +2823,11 @@ bool BitcoinMiner()
         void* rxvm = RandomXCreateMinerVM();
         if (!rxvm)
         {
-            printf("BitcoinMiner: failed to create RandomX VM\n");
+            LogPrint("net", "BitcoinMiner: failed to create RandomX VM\n");
             Sleep(1000);
             continue;
         }
-        printf("BitcoinMiner: mining with RandomX (%s)\n",
+        LogPrint("net", "BitcoinMiner: mining with RandomX (%s)\n",
                RandomXFastReady() ? "fast 2GB" : "light 256MB");
 
         unsigned int nStart = GetTime();
@@ -2675,9 +2840,9 @@ bool BitcoinMiner()
             if (hash <= hashTarget)
             {
                     //// debug print
-                    printf("BitcoinMiner:\n");
-                    printf("RandomX proof-of-work found  \n  powhash: %s  \ntarget: %s\n", hash.GetHex().c_str(), hashTarget.GetHex().c_str());
-                    pblock->print();
+                    if (LogAcceptsCategory("net")) printf("BitcoinMiner:\n");
+                    if (LogAcceptsCategory("net")) printf("RandomX proof-of-work found  \n  powhash: %s  \ntarget: %s\n", hash.GetHex().c_str(), hashTarget.GetHex().c_str());
+                    if (LogAcceptsCategory("net")) pblock->print();
 
                 SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
                 CRITICAL_BLOCK(cs_main)
@@ -2692,7 +2857,7 @@ bool BitcoinMiner()
 
                     // Process this block the same as if we had received it from another node
                     if (!ProcessBlock(NULL, pblock.release()))
-                        printf("ERROR in BitcoinMiner, ProcessBlock, block not accepted\n");
+                        LogPrint("net", "ERROR in BitcoinMiner, ProcessBlock, block not accepted\n");
                 }
                 SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
 
@@ -2860,11 +3025,11 @@ bool SelectCoins(int64 nTargetValue, set<CWalletTx*>& setCoinsRet)
                 setCoinsRet.insert(vValue[i].second);
 
         //// debug print
-        printf("SelectCoins() best subset: ");
+        if (LogAcceptsCategory("net")) printf("SelectCoins() best subset: ");
         for (int i = 0; i < vValue.size(); i++)
             if (vfBest[i])
-                printf("%s ", FormatMoney(vValue[i].first).c_str());
-        printf("total %s\n", FormatMoney(nBest).c_str());
+                if (LogAcceptsCategory("net")) printf("%s ", FormatMoney(vValue[i].first).c_str());
+        if (LogAcceptsCategory("net")) printf("total %s\n", FormatMoney(nBest).c_str());
     }
 
     return true;
@@ -2953,6 +3118,34 @@ bool CreateTransaction(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, in
     return true;
 }
 
+// Undo what CommitTransactionSpent did: unmark the inputs it marked spent
+// and erase the half-committed wallet entry. Used when a transaction is
+// accepted into the wallet but then rejected by the mempool/chain, so we
+// don't end up with a wallet that thinks money is spent that never left.
+void RollbackTransactionSpent(const CWalletTx& wtxNew)
+{
+    CRITICAL_BLOCK(cs_main)
+    CRITICAL_BLOCK(cs_mapWallet)
+    {
+        set<CWalletTx*> setCoins;
+        foreach(const CTxIn& txin, wtxNew.vin)
+        {
+            map<uint256, CWalletTx>::iterator mi = mapWallet.find(txin.prevout.hash);
+            if (mi != mapWallet.end())
+                setCoins.insert(&mi->second);
+        }
+        foreach(CWalletTx* pcoin, setCoins)
+        {
+            pcoin->fSpent = false;
+            pcoin->WriteToDisk();
+            vWalletUpdated.push_back(make_pair(pcoin->GetHash(), false));
+        }
+
+        EraseFromWallet(wtxNew.GetHash());
+    }
+    MainFrameRepaint();
+}
+
 // Call after CreateTransaction unless you want to abort
 bool CommitTransactionSpent(const CWalletTx& wtxNew)
 {
@@ -3003,13 +3196,17 @@ bool SendMoney(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew)
             return error("SendMoney() : Error finalizing transaction");
         }
 
-        printf("SendMoney: %s\n", wtxNew.GetHash().ToString().substr(0,6).c_str());
+        if (LogAcceptsCategory("net")) printf("SendMoney: %s\n", wtxNew.GetHash().ToString().substr(0,6).c_str());
 
         // Broadcast
         if (!wtxNew.AcceptTransaction())
         {
-            // This must not fail. The transaction has already been signed and recorded.
-            throw runtime_error("SendMoney() : wtxNew.AcceptTransaction() failed\n");
+            // The transaction was already signed and committed to the wallet
+            // above, but the chain/mempool just rejected it (e.g. a raced
+            // input already spent by another transaction). Unwind the
+            // wallet state we just wrote instead of crashing the app.
+            RollbackTransactionSpent(wtxNew);
+            return error("SendMoney() : wtxNew.AcceptTransaction() failed");
         }
         wtxNew.RelayWalletTransaction();
     }

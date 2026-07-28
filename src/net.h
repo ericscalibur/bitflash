@@ -22,12 +22,10 @@ enum
 
 
 
-bool ConnectSocket(const CAddress& addrConnect, SOCKET& hSocketRet);
 bool GetMyExternalIP(unsigned int& ipRet);
-bool AddAddress(CAddrDB& addrdb, const CAddress& addr);
-CNode* FindNode(unsigned int ip);
-CNode* ConnectNode(CAddress addrConnect, int64 nTimeout=0);
 CNode* ConnectNodeBtf(const string& strBtfAddr);
+CNode* ConnectNodeBtfResolved(const string& strBtfAddr, const string& strMeeting,
+                              const unsigned char enc_pub[32]);
 void ThreadBtfAccept(void* parg);
 void ThreadBtfConnect(void* parg);
 extern string strBtfConnect;
@@ -120,7 +118,7 @@ public:
         // Message size
         if (nMessageSize > 0x10000000)
         {
-            printf("CMessageHeader::IsValid() : nMessageSize too large %u\n", nMessageSize);
+            if (LogAcceptsCategory("net")) printf("CMessageHeader::IsValid() : nMessageSize too large %u\n", nMessageSize);
             return false;
         }
 
@@ -294,7 +292,7 @@ public:
 
     void print() const
     {
-        printf("CAddress(%s)\n", ToString().c_str());
+        if (LogAcceptsCategory("net")) printf("CAddress(%s)\n", ToString().c_str());
     }
 };
 
@@ -387,7 +385,7 @@ public:
 
     void print() const
     {
-        printf("CInv(%s)\n", ToString().c_str());
+        if (LogAcceptsCategory("net")) printf("CInv(%s)\n", ToString().c_str());
     }
 };
 
@@ -426,13 +424,10 @@ extern bool fShutdown;
 extern array<bool, 10> vfThreadRunning;
 extern vector<CNode*> vNodes;
 extern CCriticalSection cs_vNodes;
-extern map<vector<unsigned char>, CAddress> mapAddresses;
-extern CCriticalSection cs_mapAddresses;
 extern map<CInv, CDataStream> mapRelay;
 extern deque<pair<int64, CInv> > vRelayExpiration;
 extern CCriticalSection cs_mapRelay;
 extern map<CInv, int64> mapAlreadyAskedFor;
-extern CAddress addrProxy;
 
 
 
@@ -461,10 +456,6 @@ public:
     int64 nReleaseTime;
     map<uint256, CRequestTracker> mapRequests;
     CCriticalSection cs_mapRequests;
-
-    // flood
-    vector<CAddress> vAddrToSend;
-    set<CAddress> setAddrKnown;
 
     // inventory based relay
     set<CInv> setInventoryKnown;
@@ -555,7 +546,7 @@ public:
         // We're using mapAskFor as a priority queue,
         // the key is the earliest time the request can be sent
         int64& nRequestTime = mapAlreadyAskedFor[inv];
-        printf("askfor %s  %lld\n", inv.ToString().c_str(), nRequestTime);
+        if (LogAcceptsCategory("net")) printf("askfor %s  %lld\n", inv.ToString().c_str(), nRequestTime);
 
         // Make sure not to reuse time indexes to keep things in the same order
         int64 nNow = (GetTime() - 1) * 1000000;
@@ -576,7 +567,7 @@ public:
             AbortMessage();
         nPushPos = vSend.size();
         vSend << CMessageHeader(pszCommand, 0);
-        printf("sending: %-12s ", pszCommand);
+        if (LogAcceptsCategory("net")) printf("sending: %-12s ", pszCommand);
     }
 
     void AbortMessage()
@@ -586,7 +577,7 @@ public:
         vSend.resize(nPushPos);
         nPushPos = -1;
         LeaveCriticalSection(&cs_vSend);
-        printf("(aborted)\n");
+        if (LogAcceptsCategory("net")) printf("(aborted)\n");
     }
 
     void EndMessage()
@@ -594,7 +585,7 @@ public:
         extern int nDropMessagesTest;
         if (nDropMessagesTest > 0 && GetRand(nDropMessagesTest) == 0)
         {
-            printf("dropmessages DROPPING SEND MESSAGE\n");
+            if (LogAcceptsCategory("net")) printf("dropmessages DROPPING SEND MESSAGE\n");
             AbortMessage();
             return;
         }
@@ -606,10 +597,10 @@ public:
         unsigned int nSize = vSend.size() - nPushPos - sizeof(CMessageHeader);
         memcpy((char*)&vSend[nPushPos] + offsetof(CMessageHeader, nMessageSize), &nSize, sizeof(nSize));
 
-        printf("(%d bytes)  ", nSize);
+        if (LogAcceptsCategory("net")) printf("(%d bytes)  ", nSize);
         //for (int i = nPushPos+sizeof(CMessageHeader); i < min(vSend.size(), nPushPos+sizeof(CMessageHeader)+20U); i++)
         //    printf("%02x ", vSend[i] & 0xff);
-        printf("\n");
+        if (LogAcceptsCategory("net")) printf("\n");
 
         nPushPos = -1;
         LeaveCriticalSection(&cs_vSend);

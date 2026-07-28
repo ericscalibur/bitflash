@@ -26,11 +26,14 @@ typedef unsigned long long  uint64;
 #define UEND(a)             ((unsigned char*)&((&(a))[1]))
 #define ARRAYLEN(array)     (sizeof(array)/sizeof((array)[0]))
 
-// Route printf to debug.log (and the console) on the GUI Windows build and on
-// the headless Linux build alike.
-#if defined(_WINDOWS) || !defined(_WIN32)
+// Route printf to debug.log (and the console on non-Windows) everywhere.
+// (Previously gated on `defined(_WINDOWS) || !defined(_WIN32)` -- but
+// _WINDOWS is only ever defined by the legacy, unused makefile.vc build;
+// the real Windows build (makefile.mingw) never defines it, so on actual
+// Windows this condition was always false and debug.log was never written.
+// OutputDebugStringF() is already platform-safe internally: it always
+// writes debug.log, and only echoes to the console when not on Windows.)
 #define printf              OutputDebugStringF
-#endif
 
 #ifdef snprintf
 #undef snprintf
@@ -69,6 +72,35 @@ inline T& REF(const T& val)
 
 
 extern bool fDebug;
+
+// ---------------------------------------------------------------------------
+// Categorized, burst-collapsing logging
+//
+// Plain printf() (routed to OutputDebugStringF below) writes every call
+// unfiltered to debug.log. That's fine for one-off events, but a loop that
+// logs once per item -- once per discovered peer, once per connect attempt,
+// once per share -- turns debug.log into a wall of near-identical lines that
+// differ only by an address, while the line that actually explains a stuck
+// flow ("Stratum: no job available for ...") scrolls off screen under the
+// noise. LogPrint() is a drop-in replacement for printf() that fixes both
+// problems without touching call sites' formatting:
+//
+//   1. Category tag: every call names the subsystem it belongs to ("pool",
+//      "worker", "payout", "net", "nostr", ...). LogAcceptsCategory()
+//      controls what's written (see util.cpp); the pool/worker/payout flow
+//      the person actually needs visibility into is on by default.
+//   2. Burst collapse: repeated LogPrint() calls from the *same source line*
+//      only emit one line per DEDUP_WINDOW_SECS; if more calls land inside
+//      that window they're counted instead of reprinted, and the count is
+//      flushed as a single "(xN similar in Ws)" line the moment the window
+//      rolls over. A loop discovering 500 peers by address now produces a
+//      small, bounded number of lines instead of 500 -- log growth is capped
+//      by elapsed time, not by how many similar events happen to fire.
+// ---------------------------------------------------------------------------
+bool LogAcceptsCategory(const char* category);
+void LogPrintDedup(const char* category, const char* file, int line, const std::string& msg);
+#define LogPrint(category, ...) \
+    do { if (LogAcceptsCategory(category)) LogPrintDedup((category), __FILE__, __LINE__, strprintf(__VA_ARGS__)); } while (0)
 
 void RandAddSeed(bool fPerfmon=false);
 int my_snprintf(char* buffer, size_t limit, const char* format, ...);
@@ -231,7 +263,7 @@ void PrintHex(const T pbegin, const T pend, const char* pszFormat="%s", bool fSp
 
 
 
-// Forward declaration — defined in main.cpp
+// Forward declaration -- defined in main.cpp
 string GetAppDir();
 
 inline int OutputDebugStringF(const char* pszFormat, ...)

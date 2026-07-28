@@ -12,7 +12,6 @@
 
 void ThreadMessageHandler2(void* parg);
 void ThreadSocketHandler2(void* parg);
-void ThreadOpenConnections2(void* parg);
 
 
 
@@ -32,68 +31,11 @@ bool fShutdown = false;
 array<bool, 10> vfThreadRunning;
 vector<CNode*> vNodes;
 CCriticalSection cs_vNodes;
-map<vector<unsigned char>, CAddress> mapAddresses;
-CCriticalSection cs_mapAddresses;
 map<CInv, CDataStream> mapRelay;
 deque<pair<int64, CInv> > vRelayExpiration;
 CCriticalSection cs_mapRelay;
 map<CInv, int64> mapAlreadyAskedFor;
 string strBtfConnect; // .btf peer to keep connected to (from /connectbtf)
-
-
-
-CAddress addrProxy;
-
-bool ConnectSocket(const CAddress& addrConnect, SOCKET& hSocketRet)
-{
-    hSocketRet = INVALID_SOCKET;
-
-    SOCKET hSocket = socket(AF_INET, SOCK_STREAM, 0);
-    if (hSocket == INVALID_SOCKET)
-        return false;
-
-    bool fRoutable = !(addrConnect.GetByte(3) == 10 || (addrConnect.GetByte(3) == 192 && addrConnect.GetByte(2) == 168));
-    bool fProxy = (addrProxy.ip && fRoutable);
-    struct sockaddr_in sockaddr = (fProxy ? addrProxy.GetSockAddr() : addrConnect.GetSockAddr());
-
-    if (connect(hSocket, (struct sockaddr*)&sockaddr, sizeof(sockaddr)) == SOCKET_ERROR)
-    {
-        closesocket(hSocket);
-        return false;
-    }
-
-    if (fProxy)
-    {
-        printf("Proxy connecting to %s\n", addrConnect.ToString().c_str());
-        char pszSocks4IP[] = "\4\1\0\0\0\0\0\0user";
-        memcpy(pszSocks4IP + 2, &addrConnect.port, 2);
-        memcpy(pszSocks4IP + 4, &addrConnect.ip, 4);
-        char* pszSocks4 = pszSocks4IP;
-        int nSize = sizeof(pszSocks4IP);
-
-        int ret = send(hSocket, pszSocks4, nSize, 0);
-        if (ret != nSize)
-        {
-            closesocket(hSocket);
-            return error("Error sending to proxy\n");
-        }
-        char pchRet[8];
-        if (recv(hSocket, pchRet, 8, 0) != 8)
-        {
-            closesocket(hSocket);
-            return error("Error reading proxy response\n");
-        }
-        if (pchRet[1] != 0x5a)
-        {
-            closesocket(hSocket);
-            return error("Proxy returned error %d\n", pchRet[1]);
-        }
-        printf("Proxy connection established %s\n", addrConnect.ToString().c_str());
-    }
-
-    hSocketRet = hSocket;
-    return true;
-}
 
 
 bool GetMyExternalIP(unsigned int& ipRet)
@@ -176,38 +118,6 @@ bool GetMyExternalIP(unsigned int& ipRet)
 
 
 
-
-
-bool AddAddress(CAddrDB& addrdb, const CAddress& addr)
-{
-    if (!addr.IsRoutable())
-        return false;
-    if (addr.ip == addrLocalHost.ip)
-        return false;
-    CRITICAL_BLOCK(cs_mapAddresses)
-    {
-        map<vector<unsigned char>, CAddress>::iterator it = mapAddresses.find(addr.GetKey());
-        if (it == mapAddresses.end())
-        {
-            // New address
-            mapAddresses.insert(make_pair(addr.GetKey(), addr));
-            addrdb.WriteAddress(addr);
-            return true;
-        }
-        else
-        {
-            CAddress& addrFound = (*it).second;
-            if ((addrFound.nServices | addr.nServices) != addrFound.nServices)
-            {
-                // Services have been added
-                addrFound.nServices |= addr.nServices;
-                addrdb.WriteAddress(addrFound);
-                return true;
-            }
-        }
-    }
-    return false;
-}
 
 
 
@@ -330,64 +240,6 @@ CNode* FindNode(unsigned int ip)
     return NULL;
 }
 
-CNode* FindNode(CAddress addr)
-{
-    CRITICAL_BLOCK(cs_vNodes)
-    {
-        foreach(CNode* pnode, vNodes)
-            if (pnode->addr == addr)
-                return (pnode);
-    }
-    return NULL;
-}
-
-CNode* ConnectNode(CAddress addrConnect, int64 nTimeout)
-{
-    if (addrConnect.ip == addrLocalHost.ip)
-        return NULL;
-
-    // Look for an existing connection
-    CNode* pnode = FindNode(addrConnect.ip);
-    if (pnode)
-    {
-        if (nTimeout != 0)
-            pnode->AddRef(nTimeout);
-        else
-            pnode->AddRef();
-        return pnode;
-    }
-
-    if (fDebug)
-        printf("trying %s\n", addrConnect.ToString().c_str());
-
-    // Connect
-    SOCKET hSocket;
-    if (ConnectSocket(addrConnect, hSocket))
-    {
-        if (fDebug)
-            printf("connected %s\n", addrConnect.ToString().c_str());
-
-        // Add node
-        CNode* pnode = new CNode(hSocket, addrConnect, false);
-        if (nTimeout != 0)
-            pnode->AddRef(nTimeout);
-        else
-            pnode->AddRef();
-        CRITICAL_BLOCK(cs_vNodes)
-            vNodes.push_back(pnode);
-
-        CRITICAL_BLOCK(cs_mapAddresses)
-            mapAddresses[addrConnect.GetKey()].nLastFailed = 0;
-        return pnode;
-    }
-    else
-    {
-        CRITICAL_BLOCK(cs_mapAddresses)
-            mapAddresses[addrConnect.GetKey()].nLastFailed = GetTime();
-        return NULL;
-    }
-}
-
 // Synthetic marker address for a tunneled `.btf` peer. The real endpoint is
 // unknown by design (the tunnel hides it), so tag the CNode with a non-routable
 // 10.x.x.x address (fails IsRoutable, so it is never gossiped as a real peer)
@@ -401,20 +253,15 @@ static CAddress BtfMarkerAddr(const unsigned char b5[5])
     return CAddress(ip, port, nLocalServices);
 }
 
-// Connect to a peer by its `.btf` address: resolve the self-certified
-// descriptor over Nostr, then tunnel through its meeting node with the
-// end-to-end channel. Neither side ever learns the other's IP.
-CNode* ConnectNodeBtf(const string& strBtfAddr)
+// Shared tail: given a peer's pubkey and already-resolved rendezvous
+// coordinates, open the tunnel and register the CNode. Used by both
+// ConnectNodeBtf (which resolves the descriptor itself) and
+// ConnectNodeBtfResolved (which takes an already-resolved descriptor, so it
+// makes no Nostr relay calls at all -- see nostr.cpp's BtfResolveMany for why
+// that matters when dialing many candidates in parallel).
+static CNode* ConnectNodeBtfTail(const string& strBtfAddr, const unsigned char pk[32],
+                                  const string& strMeeting, const unsigned char enc_pub[32])
 {
-    unsigned char pk[32];
-    if (!btf::ParseAddress(strBtfAddr, pk))
-    {
-        printf("ConnectNodeBtf: invalid address %s\n", strBtfAddr.c_str());
-        return NULL;
-    }
-    if (BtfLocalAddress() == strBtfAddr)
-        return NULL; // ourselves
-
     CAddress addr = BtfMarkerAddr(pk);
     CNode* pnode = FindNode(addr.ip);
     if (pnode)
@@ -423,17 +270,6 @@ CNode* ConnectNodeBtf(const string& strBtfAddr)
         return pnode;
     }
 
-    if (fDebug)
-        printf("trying %s\n", strBtfAddr.c_str());
-
-    string strMeeting;
-    unsigned char enc_pub[32];
-    if (!BtfResolve(strBtfAddr, strMeeting, enc_pub))
-    {
-        if (fDebug)
-            printf("ConnectNodeBtf: could not resolve a descriptor for %s\n", strBtfAddr.c_str());
-        return NULL;
-    }
     size_t colon = strMeeting.rfind(':');
     if (colon == string::npos)
         return NULL;
@@ -446,12 +282,12 @@ CNode* ConnectNodeBtf(const string& strBtfAddr)
     if (hSocket == INVALID_SOCKET)
     {
         if (fDebug)
-            printf("ConnectNodeBtf: tunnel to %s via %s failed\n", strBtfAddr.c_str(), strMeeting.c_str());
+            LogPrint("net", "ConnectNodeBtf: tunnel to %s via %s failed\n", strBtfAddr.c_str(), strMeeting.c_str());
         return NULL;
     }
 
     if (fDebug)
-        printf("connected %s via rendezvous %s\n", strBtfAddr.c_str(), strMeeting.c_str());
+        LogPrint("net", "connected %s via rendezvous %s\n", strBtfAddr.c_str(), strMeeting.c_str());
 
     // Add node
     pnode = new CNode(hSocket, addr, false);
@@ -459,6 +295,53 @@ CNode* ConnectNodeBtf(const string& strBtfAddr)
     CRITICAL_BLOCK(cs_vNodes)
         vNodes.push_back(pnode);
     return pnode;
+}
+
+// Connect to a peer by its `.btf` address: resolve the self-certified
+// descriptor over Nostr, then tunnel through its meeting node with the
+// end-to-end channel. Neither side ever learns the other's IP.
+CNode* ConnectNodeBtf(const string& strBtfAddr)
+{
+    unsigned char pk[32];
+    if (!btf::ParseAddress(strBtfAddr, pk))
+    {
+        LogPrint("net", "ConnectNodeBtf: invalid address %s\n", strBtfAddr.c_str());
+        return NULL;
+    }
+    if (BtfLocalAddress() == strBtfAddr)
+        return NULL; // ourselves
+
+    if (fDebug)
+        LogPrint("net", "trying %s\n", strBtfAddr.c_str());
+
+    string strMeeting;
+    unsigned char enc_pub[32];
+    if (!BtfResolve(strBtfAddr, strMeeting, enc_pub))
+    {
+        if (fDebug)
+            LogPrint("net", "ConnectNodeBtf: could not resolve a descriptor for %s\n", strBtfAddr.c_str());
+        return NULL;
+    }
+    return ConnectNodeBtfTail(strBtfAddr, pk, strMeeting, enc_pub);
+}
+
+// Same as ConnectNodeBtf, but skips the Nostr resolve step because the caller
+// already resolved the descriptor (e.g. via BtfResolveMany, batching many
+// addresses into one relay round-trip instead of one relay round-trip per
+// address). Makes zero relay connections -- only talks to the peer's
+// rendezvous meeting node.
+CNode* ConnectNodeBtfResolved(const string& strBtfAddr, const string& strMeeting,
+                              const unsigned char enc_pub[32])
+{
+    unsigned char pk[32];
+    if (!btf::ParseAddress(strBtfAddr, pk))
+    {
+        LogPrint("net", "ConnectNodeBtf: invalid address %s\n", strBtfAddr.c_str());
+        return NULL;
+    }
+    if (BtfLocalAddress() == strBtfAddr)
+        return NULL; // ourselves
+    return ConnectNodeBtfTail(strBtfAddr, pk, strMeeting, enc_pub);
 }
 
 // Anonymous inbound listener (this node's `.btf` hidden service). Registers at
@@ -535,7 +418,7 @@ void ThreadBtfAccept(void* parg)
         RAND_bytes(rnd, sizeof(rnd));
         CAddress addr = BtfMarkerAddr(rnd);
 
-        printf("accepted .btf connection via rendezvous %s\n", strMeeting.c_str());
+        LogPrint("net", "accepted .btf connection via rendezvous %s\n", strMeeting.c_str());
         CNode* pnode = new CNode(hSocket, addr, true);
         pnode->AddRef();
         CRITICAL_BLOCK(cs_vNodes)
@@ -574,7 +457,7 @@ void ThreadBtfConnect(void* parg)
 
 void CNode::Disconnect()
 {
-    printf("disconnecting node %s\n", addr.ToString().c_str());
+    LogPrint("net", "disconnecting node %s\n", addr.ToString().c_str());
 
     closesocket(hSocket);
 
@@ -653,7 +536,7 @@ void ThreadSocketHandler2(void* parg)
 
                     if (pnodeExtra->GetRefCount() <= (pnodeExtra->fNetworkNode ? 1 : 0))
                     {
-                        printf("(%d nodes) disconnecting duplicate: %s\n", vNodes.size(), pnodeExtra->addr.ToString().c_str());
+                        LogPrint("net", "(%d nodes) disconnecting duplicate: %s\n", vNodes.size(), pnodeExtra->addr.ToString().c_str());
                         if (pnodeExtra->fNetworkNode && !pnode->fNetworkNode)
                         {
                             pnode->AddRef();
@@ -745,7 +628,7 @@ void ThreadSocketHandler2(void* parg)
         if (nSelect == SOCKET_ERROR)
         {
             int nErr = WSAGetLastError();
-            printf("select failed: %d\n", nErr);
+            LogPrint("net", "select failed: %d\n", nErr);
             for (int i = 0; i <= hSocketMax; i++)
             {
                 FD_SET(i, &fdsetRecv);
@@ -784,7 +667,7 @@ void ThreadSocketHandler2(void* parg)
             }
             else
             {
-                printf("accepted connection from %s\n", addr.ToString().c_str());
+                LogPrint("net", "accepted connection from %s\n", addr.ToString().c_str());
                 CNode* pnode = new CNode(hSocket, addr, true);
                 pnode->AddRef();
                 CRITICAL_BLOCK(cs_vNodes)
@@ -823,7 +706,7 @@ void ThreadSocketHandler2(void* parg)
                     {
                         // socket closed gracefully
                         if (!pnode->fDisconnect)
-                            printf("recv: socket closed\n");
+                            LogPrint("net", "recv: socket closed\n");
                         pnode->fDisconnect = true;
                     }
                     else if (nBytes < 0)
@@ -833,7 +716,7 @@ void ThreadSocketHandler2(void* parg)
                         if (nErr != WSAEWOULDBLOCK && nErr != WSAEMSGSIZE && nErr != WSAEINTR && nErr != WSAEINPROGRESS)
                         {
                             if (!pnode->fDisconnect)
-                                printf("recv failed: %d\n", nErr);
+                                LogPrint("net", "recv failed: %d\n", nErr);
                             pnode->fDisconnect = true;
                         }
                     }
@@ -862,7 +745,7 @@ void ThreadSocketHandler2(void* parg)
                         }
                         else
                         {
-                            printf("send error %d\n", nBytes);
+                            LogPrint("net", "send error %d\n", nBytes);
                             if (pnode->ReadyToDisconnect())
                                 pnode->vSend.clear();
                         }
@@ -885,141 +768,6 @@ void ThreadSocketHandler2(void* parg)
 
 
 
-void ThreadOpenConnections(void* parg)
-{
-    IMPLEMENT_RANDOMIZE_STACK(ThreadOpenConnections(parg));
-
-    loop
-    {
-        vfThreadRunning[1] = true;
-        CheckForShutdown(1);
-        try
-        {
-            ThreadOpenConnections2(parg);
-        }
-        CATCH_PRINT_EXCEPTION("ThreadOpenConnections()")
-        vfThreadRunning[1] = false;
-        Sleep(5000);
-    }
-}
-
-void ThreadOpenConnections2(void* parg)
-{
-    printf("ThreadOpenConnections started\n");
-
-    // Initiate network connections
-    const int nMaxConnections = 15;
-    loop
-    {
-        // Wait
-        vfThreadRunning[1] = false;
-        Sleep(500);
-        while (vNodes.size() >= nMaxConnections || vNodes.size() >= mapAddresses.size())
-        {
-            CheckForShutdown(1);
-            Sleep(2000);
-        }
-        vfThreadRunning[1] = true;
-        CheckForShutdown(1);
-
-
-        // Make a list of unique class C's
-        unsigned char pchIPCMask[4] = { 0xff, 0xff, 0xff, 0x00 };
-        unsigned int nIPCMask = *(unsigned int*)pchIPCMask;
-        vector<unsigned int> vIPC;
-        CRITICAL_BLOCK(cs_mapAddresses)
-        {
-            vIPC.reserve(mapAddresses.size());
-            unsigned int nPrev = 0;
-            foreach(const PAIRTYPE(vector<unsigned char>, CAddress)& item, mapAddresses)
-            {
-                const CAddress& addr = item.second;
-                if (!addr.IsIPv4())
-                    continue;
-
-                // Taking advantage of mapAddresses being in sorted order,
-                // with IPs of the same class C grouped together.
-                unsigned int ipC = addr.ip & nIPCMask;
-                if (ipC != nPrev)
-                    vIPC.push_back(nPrev = ipC);
-            }
-        }
-
-        //
-        // The IP selection process is designed to limit vulnerability to address flooding.
-        // Any class C (a.b.c.?) has an equal chance of being chosen, then an IP is
-        // chosen within the class C.  An attacker may be able to allocate many IPs, but
-        // they would normally be concentrated in blocks of class C's.  They can hog the
-        // attention within their class C, but not the whole IP address space overall.
-        // A lone node in a class C will get as much attention as someone holding all 255
-        // IPs in another class C.
-        //
-        bool fSuccess = false;
-        int nLimit = vIPC.size();
-        while (!fSuccess && nLimit-- > 0)
-        {
-            // Choose a random class C
-            unsigned int ipC = vIPC[GetRand(vIPC.size())];
-
-            // Organize all addresses in the class C by IP
-            map<unsigned int, vector<CAddress> > mapIP;
-            CRITICAL_BLOCK(cs_mapAddresses)
-            {
-                unsigned int nDelay = ((30 * 60) << vNodes.size());
-                if (nDelay > 8 * 60 * 60)
-                    nDelay = 8 * 60 * 60;
-                for (map<vector<unsigned char>, CAddress>::iterator mi = mapAddresses.lower_bound(CAddress(ipC, 0).GetKey());
-                     mi != mapAddresses.upper_bound(CAddress(ipC | ~nIPCMask, 0xffff).GetKey());
-                     ++mi)
-                {
-                    const CAddress& addr = (*mi).second;
-                    unsigned int nRandomizer = (addr.nLastFailed * addr.ip * 7777U) % 20000;
-                    if (GetTime() - addr.nLastFailed > nDelay * nRandomizer / 10000)
-                        mapIP[addr.ip].push_back(addr);
-                }
-            }
-            if (mapIP.empty())
-                break;
-
-            // Choose a random IP in the class C
-            map<unsigned int, vector<CAddress> >::iterator mi = mapIP.begin();
-            advance(mi, GetRand(mapIP.size()));
-
-            // Once we've chosen an IP, we'll try every given port before moving on
-            foreach(const CAddress& addrConnect, (*mi).second)
-            {
-                if (addrConnect.ip == addrLocalHost.ip || !addrConnect.IsIPv4() || FindNode(addrConnect.ip))
-                    continue;
-
-                CNode* pnode = ConnectNode(addrConnect);
-                if (!pnode)
-                    continue;
-                pnode->fNetworkNode = true;
-
-                if (addrLocalHost.IsRoutable())
-                {
-                    // Advertise our address
-                    vector<CAddress> vAddrToSend;
-                    vAddrToSend.push_back(addrLocalHost);
-                    pnode->PushMessage("addr", vAddrToSend);
-                }
-
-                // Get as many addresses as we can
-                pnode->PushMessage("getaddr");
-
-                ////// should the one on the receiving end do this too?
-                // Subscribe our local subscription list
-                const unsigned int nHops = 0;
-                for (unsigned int nChannel = 0; nChannel < pnodeLocalHost->vfSubscribe.size(); nChannel++)
-                    if (pnodeLocalHost->vfSubscribe[nChannel])
-                        pnode->PushMessage("subscribe", nChannel, nHops);
-
-                fSuccess = true;
-                break;
-            }
-        }
-    }
-}
 
 
 
@@ -1187,7 +935,7 @@ bool StartNode(string& strError)
         return false;
     }
 
-    // Get our external IP in a background thread — up to 4 HTTP requests with
+    // Get our external IP in a background thread -- up to 4 HTTP requests with
     // 5s timeouts each could otherwise delay startup by 20s on first run.
     // addrIncoming from a previous session is used immediately as a fallback.
     if (addrIncoming.ip)
@@ -1224,13 +972,6 @@ bool StartNode(string& strError)
     if (_beginthread(ThreadSocketHandler, 0, new SOCKET(hListenSocket)) == -1)
     {
         strError = "Error: _beginthread(ThreadSocketHandler) failed";
-        printf("%s\n", strError.c_str());
-        return false;
-    }
-
-    if (_beginthread(ThreadOpenConnections, 0, NULL) == -1)
-    {
-        strError = "Error: _beginthread(ThreadOpenConnections) failed";
         printf("%s\n", strError.c_str());
         return false;
     }

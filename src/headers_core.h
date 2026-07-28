@@ -1,4 +1,4 @@
-// Core node headers — no GUI framework dependency.
+// Core node headers -- no GUI framework dependency.
 // Included by gui.cpp and all non-GUI source files.
 
 #ifdef _MSC_VER
@@ -63,12 +63,11 @@ inline typename std::common_type<T1,T2>::type max(const T1& a, const T2& b)
 #include "script.h"
 #include "db.h"
 #include "net.h"
-#include "irc.h"
 #include "nostr.h"
 #include "randomx_pow.h"
 #include "main.h"
 #include "market.h"
 
-// GUI callback — implemented in gui.cpp (or as no-op in headless builds)
+// GUI callback -- implemented in gui.cpp (or as no-op in headless builds)
 void MainFrameRepaint();
 string DateTimeStr(int64 nTime);

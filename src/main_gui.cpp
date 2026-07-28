@@ -1,4 +1,4 @@
-// Bitflash entry point — starts node threads then runs GUI (or headless).
+// Bitflash entry point -- starts node threads then runs GUI (or headless).
 
 #include "headers_core.h"
 #ifndef _WIN32
@@ -126,8 +126,6 @@ int main(int argc, char* argv[])
 
     ParseStartupArguments(argc, argv);
 
-    printf("Loading addresses...\n");
-    if (!LoadAddresses()) printf("Warning: error loading addr.dat\n");
     printf("Loading block index...\n");
     string strErrors;
     if (!LoadBlockIndex()) { fprintf(stderr,"LoadBlockIndex failed\n"); return 1; }

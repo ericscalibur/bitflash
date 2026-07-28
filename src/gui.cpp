@@ -1,4 +1,4 @@
-// Bitflash GUI — ImGui + GLFW + OpenGL3
+// Bitflash GUI -- ImGui + GLFW + OpenGL3
 // Same source on Linux and Windows. No platform ifdefs.
 
 #include "imgui/imgui.h"
@@ -25,6 +25,7 @@ extern std::string   strParticipantPool;
 extern CAddress      addrLocalHost;
 
 void   MainFrameRepaint();
+int    GetDiscoveredPeerCount();
 string DateTimeStr(int64 nTime);
 bool   SendMoney(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew);
 int64  GetBalance();
@@ -34,15 +35,20 @@ void   ThreadBitcoinMiner(void*);
 void   ThreadRPCServer(void*);
 
 // ---------------------------------------------------------------------------
-// State
+// Layout constants
+// ---------------------------------------------------------------------------
+static const float STATUS_BAR_H = 22.0f;
+
+// ---------------------------------------------------------------------------
+// GUI state
 // ---------------------------------------------------------------------------
 static std::string g_myAddress;
-static int64       g_balance     = 0;
+static int64       g_balance           = 0;
 static int64       g_lastWalletRefresh = 0;
-static bool        g_showSend    = false;
-static bool        g_showOptions = false;
-static bool        g_showAbout   = false;
-static bool        g_needRefresh = true;
+static bool        g_showSend          = false;
+static bool        g_showOptions       = false;
+static bool        g_showAbout         = false;
+static bool        g_needRefresh       = true;
 
 static char        g_sendAddr[128]        = {};
 static char        g_sendAmount[32]       = {};
@@ -73,36 +79,34 @@ static std::string FmtMoney(int64 n)
 static std::string FmtAge(int64 createdAt)
 {
     int64 age = GetTime() - createdAt;
-    if (age < 0)
-        age = 0;
-    if (age < 60)
-        return strprintf("%llds", (long long)age);
-    if (age < 3600)
-        return strprintf("%lldm", (long long)(age / 60));
-    return strprintf("%lldh", (long long)(age / 3600));
+    if (age < 0)  age = 0;
+    if (age < 60)   return strprintf("%llds",  (long long)age);
+    if (age < 3600) return strprintf("%lldm",  (long long)(age / 60));
+    return              strprintf("%lldh",  (long long)(age / 3600));
 }
 
-static ImVec4 ParticipantStatusColor(const std::string& status)
+static ImVec4 StatusColor(const std::string& s)
 {
-    if (status.find("failed") != std::string::npos ||
-        status.find("rejected") != std::string::npos ||
-        status.find("stopped") != std::string::npos)
-        return ImVec4(1.0f, 0.38f, 0.38f, 1.0f);
-    if (status.find("hashing") != std::string::npos ||
-        status.find("accepted") != std::string::npos ||
-        status.find("connected") != std::string::npos)
-        return ImVec4(0.35f, 1.0f, 0.45f, 1.0f);
-    if (status.find("asking") != std::string::npos ||
-        status.find("authoriz") != std::string::npos ||
-        status.find("subscrib") != std::string::npos)
-        return ImVec4(1.0f, 0.75f, 0.25f, 1.0f);
-    return ImVec4(0.55f, 0.80f, 1.0f, 1.0f);
+    if (s.find("failed")   != std::string::npos ||
+        s.find("rejected") != std::string::npos ||
+        s.find("stopped")  != std::string::npos)
+        return ImVec4(1.0f, 0.38f, 0.38f, 1.0f);   // red
+    if (s.find("hashing")  != std::string::npos ||
+        s.find("accepted") != std::string::npos ||
+        s.find("connected")!= std::string::npos)
+        return ImVec4(0.35f, 1.0f, 0.45f, 1.0f);   // green
+    if (s.find("asking")   != std::string::npos ||
+        s.find("authoriz") != std::string::npos ||
+        s.find("subscrib") != std::string::npos)
+        return ImVec4(1.0f, 0.75f, 0.25f, 1.0f);   // amber
+    return ImVec4(0.55f, 0.80f, 1.0f, 1.0f);        // blue-grey
 }
 
 static std::string PoolLabel(const BtfPoolAnnouncement& ann)
 {
     std::ostringstream o;
-    o << ann.poolName << " - " << std::fixed << std::setprecision(2) << ann.feePercent << "%";
+    o << ann.poolName << " - "
+      << std::fixed << std::setprecision(2) << ann.feePercent << "%";
     if (ann.connectedMiners > 0)
         o << " - " << ann.connectedMiners << " miners";
     return o.str();
@@ -118,19 +122,47 @@ static void RefreshWallet()
     g_txRows.clear();
     TRY_CRITICAL_BLOCK(cs_mapWallet)
     {
-        std::vector<std::pair<int64,uint256>> vs;
-        for (auto& kv : mapWallet) vs.push_back({kv.second.GetTxTime(), kv.first});
-        std::sort(vs.rbegin(), vs.rend());
+        // Sort: unconfirmed first (depth 0), then by depth ascending (least
+        // deep = most recent). We can't use nTimeReceived because a node
+        // resync re-stamps all txs with the same time. Depth is always correct.
+        std::vector<std::pair<int,uint256>> vs;
+        for (auto& kv : mapWallet)
+            vs.push_back({kv.second.GetDepthInMainChain(), kv.second.GetHash()});
+        std::sort(vs.begin(), vs.end(),
+            [](const std::pair<int,uint256>& a, const std::pair<int,uint256>& b) {
+                return a.first < b.first; // 0 (unconfirmed) first, then shallowest
+            });
         for (auto& sv : vs) {
             auto mi = mapWallet.find(sv.second);
             if (mi == mapWallet.end()) continue;
             CWalletTx& wtx = mi->second;
-            int64 net = wtx.GetCredit() - wtx.GetDebit();
-            int depth = wtx.GetDepthInMainChain();
+            int   depth    = wtx.GetDepthInMainChain();
+            int   toMature = wtx.IsCoinBase() ? wtx.GetBlocksToMaturity() : 0;
+            // An orphaned coinbase has hashBlock set but depth=0 (block not in main chain).
+            // A genuinely unconfirmed tx has hashBlock==0.
+            bool isOrphaned = wtx.IsCoinBase() && wtx.hashBlock != 0 && depth == 0;
+            int64 net;
             std::string desc;
-            if (wtx.IsCoinBase())        desc = depth<1 ? "Generated (unconfirmed)" : "Generated";
-            else if (wtx.GetDebit() > 0) desc = "Sent";
-            else                          desc = "Received";
+            if (wtx.IsCoinBase()) {
+                if (isOrphaned) {
+                    net  = 0;
+                    desc = "Generated (orphaned -- block not in main chain)";
+                } else if (toMature > 0) {
+                    net  = wtx.GetValueOut();
+                    char buf[64];
+                    snprintf(buf, sizeof(buf), "Generated (matures in %d blocks)", toMature);
+                    desc = buf;
+                } else {
+                    net  = wtx.GetCredit() - wtx.GetDebit();
+                    desc = depth < 1 ? "Generated (unconfirmed)" : "Generated";
+                }
+            } else if (wtx.GetDebit() > 0) {
+                net  = wtx.GetCredit() - wtx.GetDebit();
+                desc = "Sent";
+            } else {
+                net  = wtx.GetCredit() - wtx.GetDebit();
+                desc = "Received";
+            }
             g_txRows.push_back({DateTimeStr(wtx.GetTxTime()), desc, net, depth});
         }
     }
@@ -149,18 +181,103 @@ string DateTimeStr(int64 nTime)
 }
 
 // ---------------------------------------------------------------------------
+// Status bar -- separate fullscreen-width overlay pinned to bottom edge.
+// Drawn last so it always sits on top of everything else.
+// ---------------------------------------------------------------------------
+static void DrawStatusBar()
+{
+    ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowPos(ImVec2(0.0f, io.DisplaySize.y - STATUS_BAR_H));
+    ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x, STATUS_BAR_H));
+    ImGui::SetNextWindowBgAlpha(1.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,  ImVec2(10.0f, 3.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.13f, 0.13f, 0.13f, 1.0f));
+    ImGui::Begin("##statusbar", nullptr,
+        ImGuiWindowFlags_NoTitleBar       |
+        ImGuiWindowFlags_NoResize         |
+        ImGuiWindowFlags_NoMove           |
+        ImGuiWindowFlags_NoScrollbar      |
+        ImGuiWindowFlags_NoScrollWithMouse|
+        ImGuiWindowFlags_NoSavedSettings  |
+        ImGuiWindowFlags_NoBringToFrontOnFocus);
+    ImGui::PopStyleVar(3);
+    ImGui::PopStyleColor();
+
+    int connected  = (int)vNodes.size();
+    int discovered = GetDiscoveredPeerCount();
+
+    if (nMineMode == MINE_PARTICIPANT) {
+        uint64 sent = 0, accepted = 0;
+        double hashRate = 0.0;
+        std::string st = GetParticipantMiningStatus();
+        GetParticipantMiningStats(sent, accepted, hashRate);
+        if (sent > 0 || accepted > 0 || hashRate > 0.0)
+            ImGui::TextDisabled(
+                "Connected peers: %d  Detected peers: %d  Height: %d"
+                "  Shares: %llu sent / %llu accepted  %.2f H/s",
+                connected, discovered, nBestHeight,
+                (unsigned long long)sent, (unsigned long long)accepted, hashRate);
+        else if (!st.empty())
+            ImGui::TextDisabled(
+                "Connected peers: %d  Detected peers: %d  Height: %d  %s",
+                connected, discovered, nBestHeight, st.c_str());
+        else
+            ImGui::TextDisabled(
+                "Connected peers: %d  Detected peers: %d  Height: %d",
+                connected, discovered, nBestHeight);
+    } else if (nMineMode == MINE_OPERATOR) {
+        int miners = 0, blocksFound = 0;
+        uint64 roundShares = 0;
+        double totalHashRate = 0.0;
+        GetPoolOperatorStats(miners, blocksFound, roundShares, totalHashRate);
+        ImGui::TextDisabled(
+            "Connected peers: %d  Detected peers: %d  Height: %d"
+            "  Miners: %d  Round shares: %llu  Blocks found: %d  %.2f H/s",
+            connected, discovered, nBestHeight,
+            miners, (unsigned long long)roundShares, blocksFound, totalHashRate);
+    } else {
+        ImGui::TextDisabled(
+            "Connected peers: %d  Detected peers: %d  Height: %d",
+            connected, discovered, nBestHeight);
+    }
+
+    ImGui::End();
+}
+
+// ---------------------------------------------------------------------------
 // Main window
+//
+// Layout:
+//   [menu bar]                  -- ImGui built-in menu
+//   [header strip]              -- address, balance, send button, mine status
+//   [separator]
+//   [telemetry strip]           -- mode-specific live stats (never scrolls)
+//   [separator]
+//   [scrollable content child]  -- transactions + mode panels
+//
+// The scrollable child ends at the top of the status bar so content never
+// hides behind it. The child is explicitly sized to fill the remaining space.
 // ---------------------------------------------------------------------------
 static void DrawMainWindow()
 {
     ImGuiIO& io = ImGui::GetIO();
-    ImGui::SetNextWindowPos(ImVec2(0,0));
-    ImGui::SetNextWindowSize(io.DisplaySize);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12,12));
+
+    // Full display height minus the status bar at the bottom.
+    const float winH = io.DisplaySize.y - STATUS_BAR_H;
+
+    ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
+    ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x, winH));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.0f, 12.0f));
     ImGui::Begin("##main", nullptr,
-        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_MenuBar |
-        ImGuiWindowFlags_NoFocusOnAppearing);
+        ImGuiWindowFlags_NoTitleBar        |
+        ImGuiWindowFlags_NoResize          |
+        ImGuiWindowFlags_NoMove            |
+        ImGuiWindowFlags_NoScrollbar       |
+        ImGuiWindowFlags_NoScrollWithMouse |
+        ImGuiWindowFlags_MenuBar           |
+        ImGuiWindowFlags_NoBringToFrontOnFocus);
     ImGui::SetWindowFontScale(0.92f);
     ImGui::PopStyleVar();
 
@@ -170,179 +287,209 @@ static void DrawMainWindow()
             if (ImGui::MenuItem("Exit")) glfwSetWindowShouldClose(glfwGetCurrentContext(), true);
             ImGui::EndMenu();
         }
-        if (ImGui::MenuItem("Options"))  g_showOptions = true;
-        if (ImGui::MenuItem("About"))    g_showAbout   = true;
+        if (ImGui::MenuItem("Options")) g_showOptions = true;
+        if (ImGui::MenuItem("About"))   g_showAbout   = true;
         ImGui::EndMenuBar();
     }
 
-    // ---- Address bar ----
+    // ---- Header strip (never scrolls) ----
     ImGui::Spacing();
     ImGui::TextDisabled("Address:");
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(-80);
-    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.14f,0.14f,0.14f,1));
+    ImGui::SetNextItemWidth(-80.0f);
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.14f, 0.14f, 0.14f, 1.0f));
     ImGui::InputText("##addr", (char*)g_myAddress.c_str(), g_myAddress.size()+1,
                      ImGuiInputTextFlags_ReadOnly);
     ImGui::PopStyleColor();
     ImGui::SameLine();
     if (ImGui::Button("Copy##a")) ImGui::SetClipboardText(g_myAddress.c_str());
 
-    // ---- Balance on its own line ----
     ImGui::TextDisabled("Balance:");
     ImGui::SameLine();
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.35f,1.0f,0.35f,1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.35f, 1.0f, 0.35f, 1.0f));
     ImGui::Text("%s BTF", FmtMoney(g_balance).c_str());
     ImGui::PopStyleColor();
 
-    // ---- Toolbar ----
     ImGui::Spacing();
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f,0.40f,0.15f,1));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f,0.55f,0.20f,1));
+    ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.15f, 0.40f, 0.15f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.55f, 0.20f, 1.0f));
     if (ImGui::Button("  Send Coins  ")) g_showSend = true;
     ImGui::PopStyleColor(2);
 
-    // Mining status indicator
-    ImGui::SameLine(0, 20);
+    ImGui::SameLine(0.0f, 20.0f);
     if (fGenerateBitcoins) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f,0.6f,0.0f,1.0f));
-        const char* modeLabel = nMineMode==MINE_OPERATOR ? "Mining (operator)" :
-                                nMineMode==MINE_PARTICIPANT ? "Mining (pool)" : "Mining";
-        ImGui::Text("⬤ %s", modeLabel);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.6f, 0.0f, 1.0f));
+        const char* modeLabel =
+            nMineMode == MINE_OPERATOR   ? "Mining (operator)"  :
+            nMineMode == MINE_PARTICIPANT ? "Mining (pool)"       :
+            nMineMode == MINE_RELAY       ? "Relay"               : "Mining";
+        ImGui::Text("* %s", modeLabel);
         ImGui::PopStyleColor();
         if (nMineMode == MINE_PARTICIPANT) {
-            std::string mineStatus = GetParticipantMiningStatus();
-            if (!mineStatus.empty()) {
-                ImGui::SameLine(0, 12);
-                ImGui::PushStyleColor(ImGuiCol_Text, ParticipantStatusColor(mineStatus));
-                ImGui::Text("[%s]", mineStatus.c_str());
+            std::string st = GetParticipantMiningStatus();
+            if (!st.empty()) {
+                ImGui::SameLine(0.0f, 12.0f);
+                ImGui::PushStyleColor(ImGuiCol_Text, StatusColor(st));
+                ImGui::Text("[%s]", st.c_str());
                 ImGui::PopStyleColor();
             }
         }
     } else {
-        ImGui::TextDisabled("○ Not mining");
+        ImGui::TextDisabled("Not mining");
     }
 
     ImGui::Spacing();
     ImGui::Separator();
-    ImGui::Spacing();
 
-    // ---- Live telemetry strip ----
+    // ---- Telemetry strip (never scrolls) ----
     {
-        const char* modeName = nMineMode==MINE_OPERATOR ? "Operator" :
-                               nMineMode==MINE_PARTICIPANT ? "Participant" : "Solo";
-        int64 age = g_lastWalletRefresh > 0 ? (GetTime() - g_lastWalletRefresh) : -1;
-        if (age < 0) age = 0;
+        ImGui::Spacing();
+        const char* modeName =
+            nMineMode == MINE_OPERATOR    ? "Operator"    :
+            nMineMode == MINE_PARTICIPANT  ? "Participant" :
+            nMineMode == MINE_RELAY        ? "Relay"       : "Solo";
+        int64 age = g_lastWalletRefresh > 0 ? GetTime() - g_lastWalletRefresh : 0;
 
         ImGui::Text("Mode: %s", modeName);
-        ImGui::SameLine(0, 16);
-        ImGui::Text("Wallet refresh: %llds ago", (long long)age);
+        ImGui::SameLine(0.0f, 16.0f);
+        ImGui::TextDisabled("Wallet refreshed %llds ago", (long long)age);
 
         if (nMineMode == MINE_PARTICIPANT) {
             uint64 sent = 0, accepted = 0;
             double hashRate = 0.0;
-            std::string mineStatus = GetParticipantMiningStatus();
+            std::string st = GetParticipantMiningStatus();
             GetParticipantMiningStats(sent, accepted, hashRate);
             if (sent > 0 || accepted > 0 || hashRate > 0.0) {
-                double acceptPct = sent ? (100.0 * (double)accepted / (double)sent) : 0.0;
-                ImGui::TextDisabled("Your mining: sent %llu, accepted %llu (%.1f%%), %.2f H/s",
-                                    (unsigned long long)sent,
-                                    (unsigned long long)accepted,
-                                    acceptPct,
-                                    hashRate);
-            } else if (!mineStatus.empty()) {
-                ImGui::TextDisabled("Your mining: %s", mineStatus.c_str());
+                double pct = sent ? (100.0 * (double)accepted / (double)sent) : 0.0;
+                ImGui::TextDisabled(
+                    "Sent %llu shares, accepted %llu (%.1f%%),  %.2f H/s",
+                    (unsigned long long)sent, (unsigned long long)accepted, pct, hashRate);
+            } else if (!st.empty()) {
+                ImGui::TextDisabled("Status: %s", st.c_str());
             } else {
-                ImGui::TextDisabled("Your mining: asking pool for work");
+                ImGui::TextDisabled("Waiting for pool work...");
             }
         } else if (nMineMode == MINE_OPERATOR) {
             int miners = 0, blocksFound = 0;
             uint64 roundShares = 0;
-            GetPoolOperatorStats(miners, blocksFound, roundShares);
+            double totalHashRate = 0.0;
+            GetPoolOperatorStats(miners, blocksFound, roundShares, totalHashRate);
             if (miners > 0 || blocksFound > 0 || roundShares > 0)
-                ImGui::TextDisabled("Pool runtime: %d authorized miners, %llu round shares, %d blocks found", miners, (unsigned long long)roundShares, blocksFound);
+                ImGui::TextDisabled(
+                    "Authorized miners: %d  Round shares: %llu  Blocks found: %d  %.2f H/s",
+                    miners, (unsigned long long)roundShares, blocksFound, totalHashRate);
             else
-                ImGui::TextDisabled("Pool runtime: waiting for miners");
+                ImGui::TextDisabled("Pool server running, waiting for miners");
+        } else if (nMineMode == MINE_RELAY) {
+            ImGui::TextDisabled("Relay mode: syncing, not mining");
         } else {
-            ImGui::TextDisabled("Solo runtime: local wallet mining telemetry");
+            ImGui::TextDisabled("Solo mining");
         }
         ImGui::Spacing();
         ImGui::Separator();
         ImGui::Spacing();
     }
 
+    // ---- Scrollable content child ----
+    // Fills all remaining height in the window (cursor Y to bottom of window).
+    // Content that overflows scrolls; nothing leaks past the window edge.
+    // Size the scrollable child to fill exactly the remaining window height.
+    // GetContentRegionAvail() already accounts for padding/borders.
+    const float availH = ImGui::GetContentRegionAvail().y;
+    ImGui::BeginChild("##scroll", ImVec2(0.0f, availH), false, 0);
+
     // ---- Transaction list ----
-    float listHeight = io.DisplaySize.y * 0.26f;
-    if (listHeight < 190.0f) listHeight = 190.0f;
-    if (listHeight > 260.0f) listHeight = 260.0f;
+    float txH = io.DisplaySize.y * 0.26f;
+    if (txH < 180.0f) txH = 180.0f;
+    if (txH > 260.0f) txH = 260.0f;
+
     if (ImGui::BeginTable("txlist", 4,
-        ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-        ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp,
-        ImVec2(0, listHeight)))
+        ImGuiTableFlags_Borders     |
+        ImGuiTableFlags_RowBg       |
+        ImGuiTableFlags_ScrollY     |
+        ImGuiTableFlags_SizingStretchProp,
+        ImVec2(0.0f, txH)))
     {
         ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableSetupColumn("Status",      ImGuiTableColumnFlags_WidthFixed, 110);
-        ImGui::TableSetupColumn("Date",        ImGuiTableColumnFlags_WidthFixed, 130);
+        ImGui::TableSetupColumn("Status",      ImGuiTableColumnFlags_WidthFixed,   110.0f);
+        ImGui::TableSetupColumn("Date",        ImGuiTableColumnFlags_WidthFixed,   130.0f);
         ImGui::TableSetupColumn("Description", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Amount",      ImGuiTableColumnFlags_WidthFixed, 140);
+        ImGui::TableSetupColumn("Amount",      ImGuiTableColumnFlags_WidthFixed,   140.0f);
         ImGui::TableHeadersRow();
 
         for (auto& row : g_txRows) {
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0);
-            if (row.depth < 1)
-                ImGui::TextColored(ImVec4(1,0.6f,0,1), "Unconfirmed");
+            bool isImmatureCoinbase = (row.desc.find("matures in") != std::string::npos);
+            bool isOrphaned         = (row.desc.find("orphaned") != std::string::npos);
+            if (isOrphaned)
+                ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "Orphaned");
+            else if (row.depth < 1)
+                ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.0f, 1.0f), "Unconfirmed");
+            else if (isImmatureCoinbase)
+                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f), "Immature");
+            else if (row.depth < 6)
+                ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "%d confirm%s",
+                    row.depth, row.depth == 1 ? "" : "s");
             else
-                ImGui::Text("%d blocks deep", row.depth);
+                ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1.0f), "Confirmed");
             ImGui::TableSetColumnIndex(1);
             ImGui::TextDisabled("%s", row.date.c_str());
             ImGui::TableSetColumnIndex(2);
             ImGui::TextUnformatted(row.desc.c_str());
             ImGui::TableSetColumnIndex(3);
             if (row.amount >= 0)
-                ImGui::TextColored(ImVec4(0.35f,1,0.35f,1), "+%s BTF", FmtMoney(row.amount).c_str());
+                ImGui::TextColored(ImVec4(0.35f, 1.0f, 0.35f, 1.0f),
+                    "+%s BTF", FmtMoney(row.amount).c_str());
             else
-                ImGui::TextColored(ImVec4(1,0.4f,0.4f,1),   "%s BTF",  FmtMoney(row.amount).c_str());
+                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f),
+                    "%s BTF",  FmtMoney(row.amount).c_str());
         }
         ImGui::EndTable();
     }
 
+    // ---- Mode panels ----
     std::vector<BtfPoolAnnouncement> pools;
     BtfGetPoolAnnouncements(pools);
 
     if (nMineMode == MINE_PARTICIPANT) {
         ImGui::Spacing();
         ImGui::SeparatorText("Participant Mining");
-        ImGui::Text("Selected pool:");
+
+        ImGui::TextDisabled("Selected pool:");
+        ImGui::SameLine();
         if (strParticipantPool.empty())
-            ImGui::TextDisabled("No pool selected yet");
+            ImGui::TextDisabled("none");
         else
             ImGui::TextWrapped("%s", strParticipantPool.c_str());
 
-        const BtfPoolAnnouncement* selected = NULL;
+        const BtfPoolAnnouncement* sel = nullptr;
         for (size_t i = 0; i < pools.size(); i++)
-            if (pools[i].btfAddress == strParticipantPool) { selected = &pools[i]; break; }
+            if (pools[i].btfAddress == strParticipantPool) { sel = &pools[i]; break; }
 
-        if (selected) {
-            ImGui::Text("Pool name: %s", selected->poolName.c_str());
-            ImGui::Text("Fee: %.2f%%", selected->feePercent);
-            ImGui::Text("Live stats: %d miners, %d blocks", selected->connectedMiners, selected->blocksFound);
-            if (!selected->dashboardUrl.empty())
-                ImGui::TextWrapped("Dashboard: %s", selected->dashboardUrl.c_str());
+        if (sel) {
+            ImGui::Text("Pool: %s  Fee: %.2f%%  Miners: %d  Blocks: %d  %.2f H/s",
+                sel->poolName.c_str(), sel->feePercent,
+                sel->connectedMiners, sel->blocksFound, sel->hashRate);
+            if (!sel->dashboardUrl.empty())
+                ImGui::TextDisabled("Dashboard: %s", sel->dashboardUrl.c_str());
         } else if (!strParticipantPool.empty()) {
-            ImGui::TextDisabled("No fresh announcement found for this pool yet");
+            ImGui::TextDisabled("No live announcement for this pool yet.");
         }
 
         if (!pools.empty()) {
             ImGui::Spacing();
             ImGui::SeparatorText("Live Pools");
             if (ImGui::BeginTable("livepools", 5,
-                ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp))
+                ImGuiTableFlags_Borders |
+                ImGuiTableFlags_RowBg   |
+                ImGuiTableFlags_SizingStretchProp))
             {
-                ImGui::TableSetupColumn("Pool", ImGuiTableColumnFlags_WidthStretch);
-                ImGui::TableSetupColumn("Fee", ImGuiTableColumnFlags_WidthFixed, 70);
-                ImGui::TableSetupColumn("Stats", ImGuiTableColumnFlags_WidthFixed, 160);
+                ImGui::TableSetupColumn("Pool",      ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("Fee",       ImGuiTableColumnFlags_WidthFixed,  60.0f);
+                ImGui::TableSetupColumn("Stats",     ImGuiTableColumnFlags_WidthFixed, 150.0f);
                 ImGui::TableSetupColumn("Dashboard", ImGuiTableColumnFlags_WidthStretch);
-                ImGui::TableSetupColumn("Use", ImGuiTableColumnFlags_WidthFixed, 60);
+                ImGui::TableSetupColumn("Use",       ImGuiTableColumnFlags_WidthFixed,  50.0f);
                 ImGui::TableHeadersRow();
                 for (size_t i = 0; i < pools.size(); i++) {
                     const BtfPoolAnnouncement& ann = pools[i];
@@ -353,15 +500,19 @@ static void DrawMainWindow()
                     ImGui::TableSetColumnIndex(1);
                     ImGui::Text("%.2f%%", ann.feePercent);
                     ImGui::TableSetColumnIndex(2);
-                    ImGui::Text("%d miners, %d blocks, %s old", ann.connectedMiners, ann.blocksFound, FmtAge(ann.createdAt).c_str());
+                    ImGui::Text("%d miners  %d blocks  %.2f H/s  %s",
+                        ann.connectedMiners, ann.blocksFound, ann.hashRate,
+                        FmtAge(ann.createdAt).c_str());
                     ImGui::TableSetColumnIndex(3);
                     if (!ann.dashboardUrl.empty())
                         ImGui::TextWrapped("%s", ann.dashboardUrl.c_str());
                     else
                         ImGui::TextDisabled("-");
                     ImGui::TableSetColumnIndex(4);
-                    if (ImGui::SmallButton((std::string("Use##") + ann.btfAddress).c_str())) {
-                        strncpy(g_participantPool, ann.btfAddress.c_str(), sizeof(g_participantPool)-1);
+                    std::string btnId = "Use##" + ann.btfAddress;
+                    if (ImGui::SmallButton(btnId.c_str())) {
+                        strncpy(g_participantPool, ann.btfAddress.c_str(),
+                                sizeof(g_participantPool)-1);
                         strParticipantPool = ann.btfAddress;
                         CWalletDB().WriteSetting("strParticipantPool", strParticipantPool);
                         g_needRefresh = true;
@@ -375,55 +526,60 @@ static void DrawMainWindow()
     if (nMineMode == MINE_OPERATOR) {
         ImGui::Spacing();
         ImGui::SeparatorText("Operator Overview");
-        ImGui::Text("Pool .btf address:");
+
         std::string opAddr = BtfLocalAddress();
+        ImGui::TextDisabled("Pool .btf address:");
+        ImGui::SameLine();
         if (opAddr.empty())
-            ImGui::TextDisabled("Identity not ready yet");
+            ImGui::TextDisabled("identity not ready");
         else
             ImGui::TextWrapped("%s", opAddr.c_str());
 
+        // Pending payouts
         std::vector<PendingPayoutView> owed;
         GetPendingPayouts(owed);
         ImGui::Spacing();
-        ImGui::SeparatorText("Pending Pool Payouts (you owe miners)");
+        ImGui::SeparatorText("Pending Payouts (owed to miners)");
         if (owed.empty()) {
-            ImGui::TextDisabled("No pending pool payouts");
+            ImGui::TextDisabled("No pending payouts");
         } else if (ImGui::BeginTable("owedpayouts", 4,
-                   ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp))
+                   ImGuiTableFlags_Borders |
+                   ImGuiTableFlags_RowBg   |
+                   ImGuiTableFlags_SizingStretchProp))
         {
-            ImGui::TableSetupColumn("Matures At", ImGuiTableColumnFlags_WidthFixed, 100);
-            ImGui::TableSetupColumn("Blocks Left", ImGuiTableColumnFlags_WidthFixed, 90);
-            ImGui::TableSetupColumn("Recipients", ImGuiTableColumnFlags_WidthFixed, 90);
-            ImGui::TableSetupColumn("Total", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("Matures At",  ImGuiTableColumnFlags_WidthFixed,  90.0f);
+            ImGui::TableSetupColumn("Blocks left", ImGuiTableColumnFlags_WidthFixed,  80.0f);
+            ImGui::TableSetupColumn("Recipients",  ImGuiTableColumnFlags_WidthFixed,  80.0f);
+            ImGui::TableSetupColumn("Total",       ImGuiTableColumnFlags_WidthStretch);
             ImGui::TableHeadersRow();
             for (const PendingPayoutView& row : owed) {
-                int remaining = std::max(0, row.matureAtHeight - nBestHeight);
+                int left = std::max(0, row.matureAtHeight - nBestHeight);
                 ImGui::TableNextRow();
-                ImGui::TableSetColumnIndex(0);
-                ImGui::Text("%d", row.matureAtHeight);
-                ImGui::TableSetColumnIndex(1);
-                ImGui::Text("%d", remaining);
-                ImGui::TableSetColumnIndex(2);
-                ImGui::Text("%d", row.recipients);
-                ImGui::TableSetColumnIndex(3);
-                ImGui::Text("%s BTF", FmtMoney(row.totalAmount).c_str());
+                ImGui::TableSetColumnIndex(0); ImGui::Text("%d", row.matureAtHeight);
+                ImGui::TableSetColumnIndex(1); ImGui::Text("%d", left);
+                ImGui::TableSetColumnIndex(2); ImGui::Text("%d", row.recipients);
+                ImGui::TableSetColumnIndex(3); ImGui::Text("%s BTF", FmtMoney(row.totalAmount).c_str());
             }
             ImGui::EndTable();
         }
 
+        // Workers
         std::vector<PoolWorkerStatView> workers;
         GetPoolWorkerStats(workers);
         ImGui::Spacing();
         ImGui::SeparatorText("Current Round Workers");
         if (workers.empty()) {
-            ImGui::TextDisabled("No active workers in this round");
-        } else if (ImGui::BeginTable("workers", 4,
-                   ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp))
+            ImGui::TextDisabled("No active workers this round");
+        } else if (ImGui::BeginTable("workers", 5,
+                   ImGuiTableFlags_Borders |
+                   ImGuiTableFlags_RowBg   |
+                   ImGuiTableFlags_SizingStretchProp))
         {
-            ImGui::TableSetupColumn("Payout Addr", ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupColumn("Worker", ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupColumn("Round Shares", ImGuiTableColumnFlags_WidthFixed, 90);
-            ImGui::TableSetupColumn("Last Seen", ImGuiTableColumnFlags_WidthFixed, 100);
+            ImGui::TableSetupColumn("Payout Address", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("Worker",         ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("Hashrate",       ImGuiTableColumnFlags_WidthFixed,  90.0f);
+            ImGui::TableSetupColumn("Round shares",   ImGuiTableColumnFlags_WidthFixed,  90.0f);
+            ImGui::TableSetupColumn("Last seen",      ImGuiTableColumnFlags_WidthFixed,  90.0f);
             ImGui::TableHeadersRow();
             for (const PoolWorkerStatView& row : workers) {
                 ImGui::TableNextRow();
@@ -432,53 +588,19 @@ static void DrawMainWindow()
                 ImGui::TableSetColumnIndex(1);
                 ImGui::TextDisabled("%s", row.worker.empty() ? "worker" : row.worker.c_str());
                 ImGui::TableSetColumnIndex(2);
-                ImGui::Text("%llu", (unsigned long long)row.roundShares);
+                ImGui::Text("%.2f H/s", row.hashRate);
                 ImGui::TableSetColumnIndex(3);
-                ImGui::TextDisabled("%s", FmtAge(row.lastSeen).c_str());
+                ImGui::Text("%llu", (unsigned long long)row.roundShares);
+                ImGui::TableSetColumnIndex(4);
+                ImGui::TextDisabled("%s ago", FmtAge(row.lastSeen).c_str());
             }
             ImGui::EndTable();
         }
     }
 
-    // ---- Status bar ----
-    {
-        ImGui::Spacing();
-        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4,2));
-
-        int peers = (int)vNodes.size();
-        if (nMineMode == MINE_PARTICIPANT) {
-            uint64 sent = 0, accepted = 0;
-            double hashRate = 0.0;
-            std::string mineStatus = GetParticipantMiningStatus();
-            GetParticipantMiningStats(sent, accepted, hashRate);
-            if (sent > 0 || accepted > 0 || hashRate > 0.0)
-                ImGui::TextDisabled("Peers %d  height %d  shares sent %llu  accepted %llu  hash rate %.2f H/s",
-                                    peers,
-                                    nBestHeight,
-                                    (unsigned long long)sent,
-                                    (unsigned long long)accepted,
-                                    hashRate);
-            else if (!mineStatus.empty())
-                ImGui::TextDisabled("Peers %d  height %d  %s", peers, nBestHeight, mineStatus.c_str());
-            else
-                ImGui::TextDisabled("Peers %d  height %d  asking pool for work", peers, nBestHeight);
-        } else if (nMineMode == MINE_OPERATOR) {
-            int miners = 0, blocksFound = 0;
-            uint64 roundShares = 0;
-            GetPoolOperatorStats(miners, blocksFound, roundShares);
-            if (miners > 0 || blocksFound > 0 || roundShares > 0)
-                ImGui::TextDisabled("Peers %d  height %d  authorized miners %d  round shares %llu  blocks found %d",
-                                    peers, nBestHeight, miners, (unsigned long long)roundShares, blocksFound);
-            else
-                ImGui::TextDisabled("Peers %d  height %d  waiting for miners", peers, nBestHeight);
-        } else {
-            ImGui::TextDisabled("Peers %d  height %d", peers, nBestHeight);
-        }
-        ImGui::PopStyleVar();
-    }
-
+    ImGui::EndChild(); // ##scroll
     ImGui::SetWindowFontScale(1.0f);
-    ImGui::End();
+    ImGui::End(); // ##main
 }
 
 // ---------------------------------------------------------------------------
@@ -487,42 +609,53 @@ static void DrawMainWindow()
 static void DrawSendDialog()
 {
     if (!g_showSend) return;
-    ImGui::SetNextWindowSize(ImVec2(500, 180), ImGuiCond_Always);
-    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Always, ImVec2(.5f,.5f));
+    ImGui::SetNextWindowSize(ImVec2(500.0f, 180.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(),
+                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     if (ImGui::Begin("Send Coins", &g_showSend,
         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse))
     {
         ImGui::Text("Recipient address:");
-        ImGui::SetNextItemWidth(-1);
+        ImGui::SetNextItemWidth(-1.0f);
         ImGui::InputText("##sa", g_sendAddr, sizeof(g_sendAddr));
 
         ImGui::Text("Amount (BTF):");
-        ImGui::SetNextItemWidth(180);
+        ImGui::SetNextItemWidth(180.0f);
         ImGui::InputText("##sm", g_sendAmount, sizeof(g_sendAmount));
 
         if (!g_sendStatus.empty()) {
             ImGui::Spacing();
-            ImGui::TextColored(ImVec4(1,.4f,.4f,1), "%s", g_sendStatus.c_str());
+            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f),
+                "%s", g_sendStatus.c_str());
         }
 
         ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
-        if (ImGui::Button("Send", ImVec2(90,0))) {
+        if (ImGui::Button("Send", ImVec2(90.0f, 0.0f))) {
             uint160 h; int64 nv = 0;
-            if (!AddressToHash160(g_sendAddr, h))          g_sendStatus = "Invalid address.";
-            else if (!ParseMoney(g_sendAmount,nv)||nv<=0)   g_sendStatus = "Invalid amount.";
+            if (!AddressToHash160(g_sendAddr, h))
+                g_sendStatus = "Invalid address.";
+            else if (!ParseMoney(g_sendAmount, nv) || nv <= 0)
+                g_sendStatus = "Invalid amount.";
             else {
-                CScript s; s << OP_DUP << OP_HASH160 << h << OP_EQUALVERIFY << OP_CHECKSIG;
+                CScript sc;
+                sc << OP_DUP << OP_HASH160 << h << OP_EQUALVERIFY << OP_CHECKSIG;
                 CWalletTx wtx;
-                if (SendMoney(s, nv, wtx)) {
-                    g_showSend=false; g_sendStatus="";
-                    memset(g_sendAddr,0,sizeof(g_sendAddr));
-                    memset(g_sendAmount,0,sizeof(g_sendAmount));
+                if (SendMoney(sc, nv, wtx)) {
+                    g_showSend = false;
+                    g_sendStatus = "";
+                    memset(g_sendAddr,   0, sizeof(g_sendAddr));
+                    memset(g_sendAmount, 0, sizeof(g_sendAmount));
                     g_needRefresh = true;
-                } else g_sendStatus = "Transaction failed.";
+                } else {
+                    g_sendStatus = "Transaction failed.";
+                }
             }
         }
         ImGui::SameLine();
-        if (ImGui::Button("Cancel", ImVec2(90,0))) { g_showSend=false; g_sendStatus=""; }
+        if (ImGui::Button("Cancel", ImVec2(90.0f, 0.0f))) {
+            g_showSend = false;
+            g_sendStatus = "";
+        }
     }
     ImGui::End();
 }
@@ -534,7 +667,6 @@ static void DrawOptionsDialog()
 {
     if (!g_showOptions) return;
 
-    // Always sync from current globals when dialog opens
     static bool wasOpen = false;
     if (!wasOpen) {
         g_mineRadio = nMineMode;
@@ -544,42 +676,46 @@ static void DrawOptionsDialog()
         strncpy(g_poolDash, strPoolDashboardUrl.c_str(), sizeof(g_poolDash)-1);
     }
     wasOpen = true;
-    ImGui::SetNextWindowSize(ImVec2(500, 310), ImGuiCond_Always);
-    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Always, ImVec2(.5f,.5f));
+
+    ImGui::SetNextWindowSize(ImVec2(500.0f, 335.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(),
+                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     if (ImGui::Begin("Options", &g_showOptions,
         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse))
     {
         // Transaction fee
         ImGui::SeparatorText("Transaction Fee");
         static char feeStr[32] = {};
-        if (feeStr[0]=='\0') snprintf(feeStr,sizeof(feeStr),"%s",FmtMoney(nTransactionFee).c_str());
-        ImGui::SetNextItemWidth(180);
+        if (feeStr[0] == '\0')
+            snprintf(feeStr, sizeof(feeStr), "%s", FmtMoney(nTransactionFee).c_str());
+        ImGui::SetNextItemWidth(180.0f);
         ImGui::InputText("BTF per transaction##fee", feeStr, sizeof(feeStr));
 
-        // Mining
+        // Mining mode
         ImGui::SeparatorText("Mining Mode");
-        ImGui::RadioButton("Solo  — rewards go to your wallet",       &g_mineRadio, MINE_SOLO);
-        ImGui::RadioButton("Operator  — run a pool for other miners", &g_mineRadio, MINE_OPERATOR);
-        ImGui::RadioButton("Participant  — mine to someone's pool",   &g_mineRadio, MINE_PARTICIPANT);
+        ImGui::RadioButton("Relay -- just run the node, don't mine",  &g_mineRadio, MINE_RELAY);
+        ImGui::RadioButton("Solo -- rewards go to your wallet",        &g_mineRadio, MINE_SOLO);
+        ImGui::RadioButton("Operator -- run a pool for other miners",  &g_mineRadio, MINE_OPERATOR);
+        ImGui::RadioButton("Participant -- mine to someone's pool",    &g_mineRadio, MINE_PARTICIPANT);
 
         if (g_mineRadio == MINE_OPERATOR) {
             ImGui::Spacing();
             ImGui::SeparatorText("Pool Announcement");
             ImGui::Text("Pool name:");
-            ImGui::SetNextItemWidth(-1);
+            ImGui::SetNextItemWidth(-1.0f);
             ImGui::InputText("##poolname", g_poolName, sizeof(g_poolName));
             ImGui::Text("Fee %%:");
-            ImGui::SetNextItemWidth(120);
+            ImGui::SetNextItemWidth(120.0f);
             ImGui::InputText("##poolfee", g_poolFee, sizeof(g_poolFee));
             ImGui::Text("Dashboard URL:");
-            ImGui::SetNextItemWidth(-1);
+            ImGui::SetNextItemWidth(-1.0f);
             ImGui::InputText("##pooldash", g_poolDash, sizeof(g_poolDash));
         }
 
         if (g_mineRadio == MINE_PARTICIPANT) {
             ImGui::Spacing();
             ImGui::SeparatorText("Pool Selection");
-            ImGui::TextDisabled("Pick from live discovered pools. Manual entry is disabled here.");
+            ImGui::TextDisabled("Pick from live discovered pools.");
 
             std::vector<BtfPoolAnnouncement> pools;
             BtfGetPoolAnnouncements(pools);
@@ -591,46 +727,49 @@ static void DrawOptionsDialog()
                         break;
                     }
                 }
-                if (ImGui::BeginCombo("Discovered pools", current.c_str())) {
+                if (ImGui::BeginCombo("Discovered pools##combo", current.c_str())) {
                     for (size_t i = 0; i < pools.size(); i++) {
                         const BtfPoolAnnouncement& ann = pools[i];
-                        std::string label = PoolLabel(ann);
-                        bool selected = ann.btfAddress == g_participantPool;
-                        if (ImGui::Selectable(label.c_str(), selected)) {
-                            strncpy(g_participantPool, ann.btfAddress.c_str(), sizeof(g_participantPool)-1);
-                        }
+                        bool selected = (ann.btfAddress == g_participantPool);
+                        if (ImGui::Selectable(PoolLabel(ann).c_str(), selected))
+                            strncpy(g_participantPool, ann.btfAddress.c_str(),
+                                    sizeof(g_participantPool)-1);
                     }
                     ImGui::EndCombo();
                 }
             } else {
-                ImGui::TextDisabled("No live pools discovered yet");
+                ImGui::TextDisabled("No live pools discovered yet.");
             }
         }
 
-        ImGui::Spacing();
-        const char* genLabel = fGenerateBitcoins ? "Stop Mining" : "Start Mining";
-        if (ImGui::Button(genLabel, ImVec2(130,0))) {
-            fGenerateBitcoins = fGenerateBitcoins ? 0 : 1;
-            if (fGenerateBitcoins) _beginthread(ThreadBitcoinMiner, 0, NULL);
-            CWalletDB().WriteSetting("fGenerateBitcoins", fGenerateBitcoins);
-        }
-
         ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
-        if (ImGui::Button("OK", ImVec2(90,0))) {
-            int64 fee=0;
-            if (ParseMoney(feeStr,fee)) { nTransactionFee=fee; CWalletDB().WriteSetting("nTransactionFee",nTransactionFee); }
+        if (ImGui::Button("OK", ImVec2(90.0f, 0.0f))) {
+            int64 fee = 0;
+            if (ParseMoney(feeStr, fee)) {
+                nTransactionFee = fee;
+                CWalletDB().WriteSetting("nTransactionFee", nTransactionFee);
+            }
 
-            bool changed = (g_mineRadio != nMineMode);
-            nMineMode = g_mineRadio;
-            strParticipantPool = g_participantPool;
-            strPoolName = g_poolName[0] ? g_poolName : "Bitflash Pool";
-            strPoolDashboardUrl = g_poolDash;
-            dPoolFeePercent = atof(g_poolFee);
-            CWalletDB().WriteSetting("nMineMode", nMineMode);
-            CWalletDB().WriteSetting("strParticipantPool", strParticipantPool);
-            CWalletDB().WriteSetting("strPoolName", strPoolName);
-            CWalletDB().WriteSetting("strPoolDashboardUrl", strPoolDashboardUrl);
-            CWalletDB().WriteSetting("dPoolFeePercent", dPoolFeePercent);
+            bool poolChanged =
+                nMineMode != g_mineRadio ||
+                strPoolName != (g_poolName[0] ? g_poolName : "Bitflash Pool") ||
+                strPoolDashboardUrl != g_poolDash ||
+                dPoolFeePercent != atof(g_poolFee);
+
+            nMineMode            = g_mineRadio;
+            strParticipantPool   = g_participantPool;
+            strPoolName          = g_poolName[0] ? g_poolName : "Bitflash Pool";
+            strPoolDashboardUrl  = g_poolDash;
+            dPoolFeePercent      = atof(g_poolFee);
+
+            if (nMineMode == MINE_OPERATOR && poolChanged) gAnnounceNow = true;
+
+            if (nMineMode == MINE_RELAY) {
+                fGenerateBitcoins = 0;
+            } else {
+                fGenerateBitcoins = 1;
+                if (!vfThreadRunning[3]) _beginthread(ThreadBitcoinMiner, 0, NULL);
+            }
 
             if (nMineMode == MINE_OPERATOR) {
                 if (!gPoolServerRunning) {
@@ -645,7 +784,7 @@ static void DrawOptionsDialog()
             g_showOptions = false;
         }
         ImGui::SameLine();
-        if (ImGui::Button("Cancel", ImVec2(90,0))) g_showOptions = false;
+        if (ImGui::Button("Cancel", ImVec2(90.0f, 0.0f))) g_showOptions = false;
     }
     if (!g_showOptions) wasOpen = false;
     ImGui::End();
@@ -657,18 +796,21 @@ static void DrawOptionsDialog()
 static void DrawAboutDialog()
 {
     if (!g_showAbout) return;
-    ImGui::SetNextWindowSize(ImVec2(380, 170), ImGuiCond_Always);
-    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Always, ImVec2(.5f,.5f));
+    ImGui::SetNextWindowSize(ImVec2(380.0f, 170.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(),
+                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     if (ImGui::Begin("About Bitflash", &g_showAbout,
         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse))
     {
-        ImGui::TextColored(ImVec4(1,.6f,0,1), "Bitflash  BTF  v1.1.0");
+        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.0f, 1.0f), "Bitflash  BTF  v1.1.0");
         ImGui::Spacing();
-        ImGui::TextWrapped("CPU-only cryptocurrency. RandomX proof of work. Anonymous .btf addressing over Nostr. No premine.");
+        ImGui::TextWrapped(
+            "CPU-only cryptocurrency. RandomX proof of work. "
+            "Anonymous .btf addressing over Nostr. No premine.");
         ImGui::Spacing();
         ImGui::TextDisabled("Based on Bitcoin 0.1.0 (Satoshi Nakamoto, 2009)");
         ImGui::Spacing();
-        if (ImGui::Button("OK", ImVec2(90,0))) g_showAbout = false;
+        if (ImGui::Button("OK", ImVec2(90.0f, 0.0f))) g_showAbout = false;
     }
     ImGui::End();
 }
@@ -705,34 +847,33 @@ int RunGUI(int argc, char* argv[])
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
 
-    // Load Roboto at 16px — clean, readable on all platforms
     io.Fonts->AddFontFromMemoryCompressedTTF(
-        RobotoMedium_compressed_data, RobotoMedium_compressed_size, 16.0f);
+        RobotoMedium_compressed_data, RobotoMedium_compressed_size, 14.0f);
 
     ImGui::StyleColorsDark();
-    ImGuiStyle& s = ImGui::GetStyle();
-    s.WindowRounding = s.FrameRounding = s.PopupRounding = 4.0f;
-    s.ItemSpacing    = ImVec2(10, 7);
-    s.FramePadding   = ImVec2(8, 5);
-    s.WindowPadding  = ImVec2(12, 12);
+    ImGuiStyle& st = ImGui::GetStyle();
+    st.WindowRounding = st.FrameRounding = st.PopupRounding = 4.0f;
+    st.ItemSpacing  = ImVec2(10.0f, 7.0f);
+    st.FramePadding = ImVec2(8.0f, 5.0f);
+    st.WindowPadding = ImVec2(12.0f, 12.0f);
     // Orange accent
-    s.Colors[ImGuiCol_TitleBgActive]  = ImVec4(.80f,.45f,.00f,1);
-    s.Colors[ImGuiCol_CheckMark]      = ImVec4(1.0f,.60f,.00f,1);
-    s.Colors[ImGuiCol_SliderGrab]     = ImVec4(.80f,.45f,.00f,1);
-    s.Colors[ImGuiCol_Button]         = ImVec4(.25f,.25f,.25f,1);
-    s.Colors[ImGuiCol_ButtonHovered]  = ImVec4(.80f,.45f,.00f,1);
-    s.Colors[ImGuiCol_ButtonActive]   = ImVec4(.60f,.30f,.00f,1);
-    s.Colors[ImGuiCol_Header]         = ImVec4(.80f,.45f,.00f,.40f);
-    s.Colors[ImGuiCol_HeaderHovered]  = ImVec4(.80f,.45f,.20f,.80f);
-    s.Colors[ImGuiCol_Tab]            = ImVec4(.20f,.20f,.20f,1);
-    s.Colors[ImGuiCol_TabHovered]     = ImVec4(.80f,.45f,.00f,1);
-    s.Colors[ImGuiCol_TabActive]      = ImVec4(.80f,.45f,.00f,1);
-    s.Colors[ImGuiCol_SeparatorHovered]=ImVec4(.80f,.45f,.00f,1);
-    s.Colors[ImGuiCol_FrameBg]        = ImVec4(.14f,.14f,.14f,1);
-    s.Colors[ImGuiCol_FrameBgHovered] = ImVec4(.20f,.20f,.20f,1);
-    s.Colors[ImGuiCol_TableHeaderBg]  = ImVec4(.18f,.18f,.18f,1);
-    s.Colors[ImGuiCol_TableRowBg]     = ImVec4(.11f,.11f,.11f,1);
-    s.Colors[ImGuiCol_TableRowBgAlt]  = ImVec4(.14f,.14f,.14f,1);
+    st.Colors[ImGuiCol_TitleBgActive]   = ImVec4(.80f, .45f, .00f, 1.0f);
+    st.Colors[ImGuiCol_CheckMark]       = ImVec4(1.0f, .60f, .00f, 1.0f);
+    st.Colors[ImGuiCol_SliderGrab]      = ImVec4(.80f, .45f, .00f, 1.0f);
+    st.Colors[ImGuiCol_Button]          = ImVec4(.25f, .25f, .25f, 1.0f);
+    st.Colors[ImGuiCol_ButtonHovered]   = ImVec4(.80f, .45f, .00f, 1.0f);
+    st.Colors[ImGuiCol_ButtonActive]    = ImVec4(.60f, .30f, .00f, 1.0f);
+    st.Colors[ImGuiCol_Header]          = ImVec4(.80f, .45f, .00f, .40f);
+    st.Colors[ImGuiCol_HeaderHovered]   = ImVec4(.80f, .45f, .20f, .80f);
+    st.Colors[ImGuiCol_Tab]             = ImVec4(.20f, .20f, .20f, 1.0f);
+    st.Colors[ImGuiCol_TabHovered]      = ImVec4(.80f, .45f, .00f, 1.0f);
+    st.Colors[ImGuiCol_TabActive]       = ImVec4(.80f, .45f, .00f, 1.0f);
+    st.Colors[ImGuiCol_SeparatorHovered]= ImVec4(.80f, .45f, .00f, 1.0f);
+    st.Colors[ImGuiCol_FrameBg]         = ImVec4(.14f, .14f, .14f, 1.0f);
+    st.Colors[ImGuiCol_FrameBgHovered]  = ImVec4(.20f, .20f, .20f, 1.0f);
+    st.Colors[ImGuiCol_TableHeaderBg]   = ImVec4(.18f, .18f, .18f, 1.0f);
+    st.Colors[ImGuiCol_TableRowBg]      = ImVec4(.11f, .11f, .11f, 1.0f);
+    st.Colors[ImGuiCol_TableRowBgAlt]   = ImVec4(.14f, .14f, .14f, 1.0f);
 
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init("#version 330");
@@ -744,22 +885,28 @@ int RunGUI(int argc, char* argv[])
     while (!glfwWindowShouldClose(window) && !fShutdown)
     {
         glfwPollEvents();
-        if (g_needRefresh || (frame % 120 == 0)) { RefreshWallet(); g_needRefresh = false; }
+        if (g_needRefresh || (frame % 120 == 0)) {
+            RefreshWallet();
+            g_needRefresh = false;
+        }
         frame++;
 
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
+        // Draw order matters: status bar last so it is always on top.
         DrawMainWindow();
         DrawSendDialog();
         DrawOptionsDialog();
         DrawAboutDialog();
+        DrawStatusBar();
 
         ImGui::Render();
-        int w, h; glfwGetFramebufferSize(window, &w, &h);
+        int w, h;
+        glfwGetFramebufferSize(window, &w, &h);
         glViewport(0, 0, w, h);
-        glClearColor(.08f,.08f,.08f,1);
+        glClearColor(.08f, .08f, .08f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         glfwSwapBuffers(window);

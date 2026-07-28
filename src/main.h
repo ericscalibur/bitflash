@@ -48,13 +48,17 @@ extern CBlockIndex* pindexBest;
 extern unsigned int nTransactionsUpdated;
 extern string strSetDataDir;
 extern int nDropMessagesTest;
-// Mining mode — persisted in wallet.dat
-//   MINE_SOLO (0):        mine to own wallet, no pool server
-//   MINE_OPERATOR (1):    run pool server, mine to own wallet, distribute to miners
-//   MINE_PARTICIPANT (2): connect to external pool, submit shares, receive payouts
-#define MINE_SOLO        0
-#define MINE_OPERATOR    1
-#define MINE_PARTICIPANT 2
+// Mining mode -- persisted in wallet.dat
+// Mining mode -- decided fresh every launch (CLI flags, else default). Never
+// restored from wallet.dat; see LoadWallet() in db.cpp.
+//   MINE_RELAY (0):       default. Node runs/syncs, never mines, no pool server.
+//   MINE_SOLO (1):        mine to own wallet, no pool server
+//   MINE_OPERATOR (2):    run pool server, mine to own wallet, distribute to miners
+//   MINE_PARTICIPANT (3): connect to external pool, submit shares, receive payouts
+#define MINE_RELAY       0
+#define MINE_SOLO        1
+#define MINE_OPERATOR    2
+#define MINE_PARTICIPANT 3
 extern int    nMineMode;
 extern string strParticipantPool; // participant: pool .btf address
 extern string strPoolName;        // operator: announced pool name
@@ -78,6 +82,7 @@ struct PoolWorkerStatView
     uint64 totalShares;
     uint64 roundShares;
     int64 lastSeen;
+    double hashRate; // estimated H/s, derived from share difficulty + submit rate
 };
 
 // Settings
@@ -102,11 +107,11 @@ void RelayWalletTransactions();
 bool LoadBlockIndex(bool fAllowNew=true);
 void PrintBlockTree();
 bool BitcoinMiner();
-void ThreadRPCServer(void* parg);  // rpc.cpp — .btf pool server
+void ThreadRPCServer(void* parg);  // rpc.cpp -- .btf pool server
 void GetParticipantMiningStats(uint64& sharesSent, uint64& sharesAccepted, double& hashRate);
 void SetParticipantMiningStatus(const std::string& status);
 std::string GetParticipantMiningStatus();
-void GetPoolOperatorStats(int& authorizedMiners, int& blocksFound, uint64& roundShares);
+void GetPoolOperatorStats(int& authorizedMiners, int& blocksFound, uint64& roundShares, double& totalHashRate);
 void GetPoolWorkerStats(std::vector<PoolWorkerStatView>& out);
 void GetPendingPayouts(std::vector<PendingPayoutView>& out);
 bool ProcessMessages(CNode* pfrom);

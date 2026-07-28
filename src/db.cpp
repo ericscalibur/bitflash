@@ -392,77 +392,8 @@ bool CTxDB::LoadBlockIndex()
 
 
 
-//
-// CAddrDB
-//
-
-bool CAddrDB::WriteAddress(const CAddress& addr)
-{
-    return Write(make_pair(string("addr"), addr.GetKey()), addr);
-}
-
-bool CAddrDB::LoadAddresses()
-{
-    CRITICAL_BLOCK(cs_mapAddresses)
-    {
-        // Load user provided addresses
-        CAutoFile filein = fopen("addr.txt", "rt");
-        if (filein)
-        {
-            try
-            {
-                char psz[1000];
-                while (fgets(psz, sizeof(psz), filein))
-                {
-                    CAddress addr(psz, NODE_NETWORK);
-                    if (addr.ip != 0)
-                        AddAddress(*this, addr);
-                }
-            }
-            catch (...) { }
-        }
-
-        // Get cursor
-        Dbc* pcursor = GetCursor();
-        if (!pcursor)
-            return false;
-
-        loop
-        {
-            // Read next record
-            CDataStream ssKey;
-            CDataStream ssValue;
-            int ret = ReadAtCursor(pcursor, ssKey, ssValue);
-            if (ret == DB_NOTFOUND)
-                break;
-            else if (ret != 0)
-                return false;
-
-            // Unserialize
-            string strType;
-            ssKey >> strType;
-            if (strType == "addr")
-            {
-                CAddress addr;
-                ssValue >> addr;
-                mapAddresses.insert(make_pair(addr.GetKey(), addr));
-            }
-        }
-
-        //// debug print
-        printf("mapAddresses:\n");
-        foreach(const PAIRTYPE(vector<unsigned char>, CAddress)& item, mapAddresses)
-            item.second.print();
-        printf("-----\n");
-    }
-
-    return true;
-}
-
-bool LoadAddresses()
-{
-    return CAddrDB("cr+").LoadAddresses();
-}
+// Legacy IP-based peer address database (CAddrDB / addr.dat) removed --
+// peer discovery is entirely Nostr/.btf-based now.
 
 
 
@@ -563,24 +494,28 @@ bool CWalletDB::LoadWallet(vector<unsigned char>& vchDefaultKeyRet)
             {
                 string strKey;
                 ssKey >> strKey;
-                if (strKey == "fGenerateBitcoins")  ssValue >> fGenerateBitcoins;
                 if (strKey == "nTransactionFee")    ssValue >> nTransactionFee;
                 if (strKey == "addrIncoming")       ssValue >> addrIncoming;
-                if (strKey == "nMineMode")          ssValue >> nMineMode;
-                if (strKey == "strParticipantPool") ssValue >> strParticipantPool;
-                if (strKey == "strPoolName")        ssValue >> strPoolName;
-                if (strKey == "strPoolDashboardUrl") ssValue >> strPoolDashboardUrl;
-                if (strKey == "dPoolFeePercent")    ssValue >> dPoolFeePercent;
+                // Mining-mode/pool settings (nMineMode, strParticipantPool, strPoolName,
+                // strPoolDashboardUrl, dPoolFeePercent, fGenerateBitcoins) are intentionally
+                // NOT restored here. They used to be, and LoadWallet() runs after CLI flags
+                // are parsed in main_gui.cpp, so a saved value would silently overwrite
+                // whatever was just requested on the command line or in a previous Options
+                // session -- no error, no log line. That's what caused pool name/address to
+                // show correctly in the UI but stay stale in the logs, and mode to change
+                // behavior across restarts. Mode/pool config is decided fresh every launch
+                // instead: CLI flags if given, otherwise the compiled-in default. Nothing to
+                // go stale, nothing to fight over load order.
             }
         }
     }
 
-    printf("fGenerateBitcoins = %d\n", fGenerateBitcoins);
     printf("nTransactionFee = %lld\n", nTransactionFee);
     printf("addrIncoming = %s\n", addrIncoming.ToString().c_str());
-    printf("nMineMode = %d, strParticipantPool = %s\n", nMineMode, strParticipantPool.c_str());
-    printf("strPoolName = %s, dPoolFeePercent = %.2f\n", strPoolName.c_str(), dPoolFeePercent);
-    printf("strPoolDashboardUrl = %s\n", strPoolDashboardUrl.c_str());
+    printf("nMineMode = %d, strParticipantPool = %s, fGenerateBitcoins = %d (from CLI/default, not wallet.dat)\n",
+           nMineMode, strParticipantPool.c_str(), fGenerateBitcoins);
+    printf("strPoolName = %s, dPoolFeePercent = %.2f, strPoolDashboardUrl = %s (from CLI/default, not wallet.dat)\n",
+           strPoolName.c_str(), dPoolFeePercent, strPoolDashboardUrl.c_str());
 
     return true;
 }

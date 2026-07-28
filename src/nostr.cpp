@@ -45,7 +45,12 @@ static const int64 BTF_POOL_MAX_AGE = 3 * 60; // seconds
 
 // Anonymous auto-discovery: how many peers to keep connected via .btf rendezvous
 // before we stop dialing more, and how many new dials to attempt per cycle.
-static const unsigned int BTF_TARGET_CONN   = 8;
+// Target outbound peer count. With ~100 known .btf peers on the network,
+// an Erdos-Renyi random graph stays connected with overwhelming probability
+// once average degree exceeds ln(N) (~4.6 here); 24 is ~5x past that
+// threshold, so this is plenty *provided* selection isn't fully correlated
+// across nodes -- see the diversity slice in ConnectDiscoveredBtfPeers.
+static const unsigned int BTF_TARGET_CONN   = 24;
 static const int          BTF_DIALS_PER_PASS = 12;  // try more peers per Nostr cycle
 
 // Nostr descriptor freshness cutoff: skip peers whose descriptor hasn't been
@@ -58,11 +63,27 @@ static map<string, int64> g_btfPeers;
 static CCriticalSection   cs_btfPeers;
 
 // Public discovery relays. Tunable.
+//
+// Picked for: free/public (no NIP-42 auth or payment wall), track record of
+// high uptime, and *infrastructure* diversity, not just different hostnames.
+// relay.damus.io, relay.snort.social and relay.primal.net are all fronted by
+// Cloudflare -- different operators, same upstream, so a Cloudflare-side
+// incident (or a Cloudflare IP range getting rate-limited/blocked on some
+// network) can take out several of them at once even though they look like
+// independent relays. Kept only one Cloudflare-fronted relay (damus.io, the
+// most established) and filled the rest with relays on different hosts
+// (Hetzner, various independents) so no single upstream provider is a
+// single point of failure for peer discovery. 7 relays lands inside the
+// commonly recommended 5-10 range for redundancy without keeping an
+// excessive number of persistent sockets open per node.
 const char* pszNostrRelays[] = {
     "wss://relay.damus.io",
     "wss://nos.lol",
     "wss://relay.nostr.band",
-    "wss://relay.snort.social",
+    "wss://nostr21.com",
+    "wss://offchain.pub",
+    "wss://nostr.mom",
+    "wss://relay.primal.net",
 };
 const int nNostrRelays = ARRAYLEN(pszNostrRelays);
 
@@ -317,6 +338,13 @@ std::string BtfLocalAddress()
     return g_nostrKey.BtfAddress();
 }
 
+int GetDiscoveredPeerCount()
+{
+    int n = 0;
+    CRITICAL_BLOCK(cs_btfPeers) { n = (int)g_btfPeers.size(); }
+    return n;
+}
+
 void BtfGetPoolAnnouncements(std::vector<BtfPoolAnnouncement>& out)
 {
     out.clear();
@@ -425,37 +453,54 @@ public:
         size_t colon = host.find(':');
         if (colon != string::npos) { port = atoi(host.substr(colon + 1).c_str()); host = host.substr(0, colon); }
 
-        // Resolve and connect (TCP)
-        struct addrinfo hints, *res = NULL;
+        // Resolve and connect (TCP). AF_UNSPEC so we get both A and AAAA
+        // records back and try them in the order the resolver prefers,
+        // rather than hard-failing whenever the IPv4 path to a relay is
+        // filtered/rate-limited (increasingly common for CDN-fronted
+        // relays) while a working IPv6 route exists right there in the
+        // same getaddrinfo() result.
+        struct addrinfo hints, *res = NULL, *rp = NULL;
         memset(&hints, 0, sizeof(hints));
-        hints.ai_family = AF_INET;
+        hints.ai_family = AF_UNSPEC;
         hints.ai_socktype = SOCK_STREAM;
         char portstr[16]; sprintf(portstr, "%d", port);
         if (getaddrinfo(host.c_str(), portstr, &hints, &res) != 0 || !res)
             return error("Nostr: getaddrinfo %s failed", host.c_str());
-        hSocket = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-        if (hSocket == INVALID_SOCKET) { freeaddrinfo(res); return false; }
 
-        // Socket receive/send timeout: Windows takes a DWORD of milliseconds;
-        // POSIX takes a struct timeval.
+        bool fConnected = false;
+        for (rp = res; rp != NULL; rp = rp->ai_next)
+        {
+            hSocket = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+            if (hSocket == INVALID_SOCKET)
+                continue;
+
+            // Socket receive/send timeout: Windows takes a DWORD of
+            // milliseconds; POSIX takes a struct timeval.
 #ifdef _WIN32
-        DWORD tv = timeoutSec * 1000;
-        setsockopt(hSocket, SOL_SOCKET, SO_RCVTIMEO, (char*)&tv, sizeof(tv));
-        setsockopt(hSocket, SOL_SOCKET, SO_SNDTIMEO, (char*)&tv, sizeof(tv));
+            DWORD tv = timeoutSec * 1000;
+            setsockopt(hSocket, SOL_SOCKET, SO_RCVTIMEO, (char*)&tv, sizeof(tv));
+            setsockopt(hSocket, SOL_SOCKET, SO_SNDTIMEO, (char*)&tv, sizeof(tv));
 #else
-        struct timeval tv;
-        tv.tv_sec = timeoutSec;
-        tv.tv_usec = 0;
-        setsockopt(hSocket, SOL_SOCKET, SO_RCVTIMEO, (char*)&tv, sizeof(tv));
-        setsockopt(hSocket, SOL_SOCKET, SO_SNDTIMEO, (char*)&tv, sizeof(tv));
+            struct timeval tv;
+            tv.tv_sec = timeoutSec;
+            tv.tv_usec = 0;
+            setsockopt(hSocket, SOL_SOCKET, SO_RCVTIMEO, (char*)&tv, sizeof(tv));
+            setsockopt(hSocket, SOL_SOCKET, SO_SNDTIMEO, (char*)&tv, sizeof(tv));
 #endif
 
-        if (connect(hSocket, res->ai_addr, (int)res->ai_addrlen) != 0)
-        {
-            freeaddrinfo(res);
-            return error("Nostr: connect %s:%d failed", host.c_str(), port);
+            if (connect(hSocket, rp->ai_addr, (int)rp->ai_addrlen) == 0)
+            {
+                fConnected = true;
+                break;
+            }
+
+            closesocket(hSocket);
+            hSocket = INVALID_SOCKET;
         }
         freeaddrinfo(res);
+
+        if (!fConnected)
+            return error("Nostr: connect %s:%d failed", host.c_str(), port);
 
         // TLS
         if (fTls)
@@ -598,6 +643,88 @@ private:
 };
 
 
+// Persistent relay connections. Public relays (relay.damus.io in particular)
+// rate-limit new connections per source IP fairly aggressively. Before this,
+// every single operation -- self-test, per-pass seeding, batch descriptor
+// resolve, pool announce, pool query -- opened its own fresh CWebSocket,
+// meaning a single node could fire a dozen-plus brand-new TCP+TLS+WS
+// handshakes at the same 4 relays within any given minute (ThreadNostrSeed's
+// own loop plus the separate ThreadBtfPoolAnnouncer thread, each reconnecting
+// from scratch every cycle). That's exactly what was showing up as constant
+// "handshake refused by relay.damus.io" and "connect ... failed" -- not
+// necessarily dead relays, just this node getting rate-limited by its own
+// reconnect churn.
+//
+// Now every relay-touching call reuses one long-lived socket per relay via
+// this pool, reconnecting only when a socket actually drops. That cuts fresh
+// connections from several per minute down to essentially one per relay for
+// the life of the process.
+struct RelayConn
+{
+    CWebSocket ws;
+    CCriticalSection cs;   // serializes use of this relay's socket
+    bool fConnected;
+    RelayConn() : fConnected(false) {}
+};
+static map<string, RelayConn*> g_relayPool;
+static CCriticalSection cs_relayPool;
+
+static RelayConn* GetRelayConn(const string& relay)
+{
+    CRITICAL_BLOCK(cs_relayPool)
+    {
+        map<string, RelayConn*>::iterator it = g_relayPool.find(relay);
+        if (it != g_relayPool.end())
+            return it->second;
+        RelayConn* rc = new RelayConn();
+        g_relayPool[relay] = rc;
+        return rc;
+    }
+    return NULL; // unreachable
+}
+
+// RAII lease on a relay's pooled connection: connects (if not already
+// connected) on construction, and on destruction either keeps the socket
+// alive for the next caller (if the exchange succeeded) or closes it so the
+// next caller reconnects instead of reusing a socket that may be wedged.
+// Caller must set fOk = true once its exchange with the relay completed
+// cleanly.
+class CRelayLease
+{
+public:
+    RelayConn* rc;
+    bool fOk;
+    bool fJustConnected; // true if this lease had to (re)connect, false if reusing a live socket
+
+    CRelayLease(const string& relay, int timeoutSec) : rc(NULL), fOk(false), fJustConnected(false)
+    {
+        rc = GetRelayConn(relay);
+        rc->cs.Enter();
+        if (!rc->fConnected)
+        {
+            rc->ws.Close();
+            rc->fConnected = rc->ws.Connect(relay, timeoutSec);
+            fJustConnected = rc->fConnected;
+        }
+    }
+    ~CRelayLease()
+    {
+        if (!fOk)
+        {
+            rc->ws.Close();
+            rc->fConnected = false;
+        }
+        rc->cs.Leave();
+    }
+    bool Connected() const { return rc->fConnected; }
+    CWebSocket& Ws() { return rc->ws; }
+
+private:
+    CRelayLease(const CRelayLease&);
+    CRelayLease& operator=(const CRelayLease&);
+};
+
+
 // Publish this node's self-certifying `.btf` descriptor: "reach me (this key)
 // via <meeting_node>, encrypting to my x25519 key <enc>". Signed by the node
 // key so only the address's owner can publish it (no hijacking).
@@ -673,11 +800,11 @@ bool BtfPublishPoolAnnouncement(const BtfPoolAnnouncement& ann)
     {
         try
         {
-            CWebSocket ws;
-            if (!ws.Connect(pszNostrRelays[i], 10))
+            CRelayLease lease(pszNostrRelays[i], 10);
+            if (!lease.Connected())
                 continue;
-            if (PublishPoolAnnouncementOnRelay(ws, g_nostrKey, ann))
-                fPublished = true;
+            if (PublishPoolAnnouncementOnRelay(lease.Ws(), g_nostrKey, ann))
+                fPublished = lease.fOk = true;
         }
         CATCH_PRINT_EXCEPTION("BtfPublishPoolAnnouncement")
     }
@@ -699,9 +826,10 @@ bool BtfQueryPoolAnnouncement(const std::string& poolBtfAddr, BtfPoolAnnouncemen
     {
         try
         {
-            CWebSocket ws;
-            if (!ws.Connect(pszNostrRelays[i], 10))
+            CRelayLease lease(pszNostrRelays[i], 10);
+            if (!lease.Connected())
                 continue;
+            CWebSocket& ws = lease.Ws();
 
             json filter = json::object();
             filter["authors"] = json::array({ HexEncode(pk, 32) });
@@ -756,6 +884,7 @@ bool BtfQueryPoolAnnouncement(const std::string& poolBtfAddr, BtfPoolAnnouncemen
                 else if (type == "EOSE")
                     break;
             }
+            lease.fOk = true;
         }
         CATCH_PRINT_EXCEPTION("BtfQueryPoolAnnouncement")
     }
@@ -855,12 +984,16 @@ bool BtfResolve(const std::string& btfAddr, std::string& meetingHostPort,
     {
         try
         {
-            CWebSocket ws;
-            if (!ws.Connect(pszNostrRelays[i], 10))
+            CRelayLease lease(pszNostrRelays[i], 10);
+            if (!lease.Connected())
                 continue;
             btf::Descriptor d;
-            if (!ResolveDescriptor(ws, g_nostrKey.ctx, btfAddr, d))
+            if (!ResolveDescriptor(lease.Ws(), g_nostrKey.ctx, btfAddr, d))
+            {
+                lease.fOk = true; // exchange completed, just no match
                 continue;
+            }
+            lease.fOk = true;
             if (d.meeting_node.empty() || d.meeting_node == "rendezvous-pending")
                 continue; // descriptor predates the owner's relay config
             if (!HexDecode(d.enc, enc_pub, 32))
@@ -873,14 +1006,115 @@ bool BtfResolve(const std::string& btfAddr, std::string& meetingHostPort,
     return false;
 }
 
+// Resolve MANY .btf addresses in one pass. A single relay connection carries
+// a REQ with every still-unresolved address's pubkey in "authors", instead of
+// opening one relay connection per address. This matters because callers like
+// ConnectDiscoveredBtfPeers dial many candidates in parallel; without
+// batching, each of those dial threads independently walks the same handful
+// of public relays on its own, so a pass of N candidates can fire up to
+// N * nNostrRelays near-simultaneous connections at the same few relays --
+// enough to get rate-limited or have handshakes refused, which then looks
+// like "dead peers" even though the descriptors are perfectly resolvable.
+bool BtfResolveMany(const std::vector<std::string>& btfAddrs,
+                     std::map<std::string, BtfResolvedPeer>& out)
+{
+    if (!EnsureNostrKey() || btfAddrs.empty())
+        return false;
+
+    map<string, string> hexToAddr; // pubkey hex -> .btf addr, for matching events back
+    set<string> pending;
+    for (const string& a : btfAddrs)
+    {
+        unsigned char pk[32];
+        if (!btf::ParseAddress(a, pk))
+            continue;
+        hexToAddr[HexEncode(pk, 32)] = a;
+        pending.insert(a);
+    }
+    if (pending.empty())
+        return false;
+
+    for (int i = 0; i < nNostrRelays && !fShutdown && !pending.empty(); i++)
+    {
+        try
+        {
+            CRelayLease lease(pszNostrRelays[i], 10);
+            if (!lease.Connected())
+                continue;
+            CWebSocket& ws = lease.Ws();
+
+            json authors = json::array();
+            for (auto& kv : hexToAddr)
+                if (pending.count(kv.second))
+                    authors.push_back(kv.first);
+            if (authors.empty())
+            {
+                lease.fOk = true;
+                break;
+            }
+
+            json filter = json::object();
+            filter["authors"] = authors;
+            filter["kinds"]   = json::array({ BTF_DESC_KIND });
+            filter["limit"]   = (int)authors.size();
+            json req = json::array({ "REQ", "btf-resolve-many", filter });
+            if (!ws.SendText(req.dump()))
+                continue;
+
+            for (;;)
+            {
+                string msg;
+                if (!ws.RecvText(msg))
+                    break;
+                json j;
+                try { j = json::parse(msg); } catch (...) { continue; }
+                if (!j.is_array() || j.empty()) continue;
+                string t = j[0].get<string>();
+                if (t == "EVENT" && j.size() >= 3)
+                {
+                    const json& ev = j[2];
+                    if (!ev.contains("pubkey") || !ev.contains("content"))
+                        continue;
+                    string hexpk = ev["pubkey"].get<string>();
+                    auto ai = hexToAddr.find(hexpk);
+                    if (ai == hexToAddr.end() || !pending.count(ai->second))
+                        continue; // not one we're waiting on (or already resolved)
+
+                    unsigned char pk[32];
+                    if (!HexDecode(hexpk, pk, 32))
+                        continue;
+                    btf::Descriptor d;
+                    if (!btf::VerifyDescriptor(g_nostrKey.ctx, ev["content"].get<string>(), pk, d))
+                        continue;
+                    if (d.meeting_node.empty() || d.meeting_node == "rendezvous-pending")
+                        continue;
+                    BtfResolvedPeer rp;
+                    if (!HexDecode(d.enc, rp.enc_pub, 32))
+                        continue;
+                    rp.meetingHostPort = d.meeting_node;
+                    out[ai->second] = rp;
+                    pending.erase(ai->second);
+                }
+                else if (t == "EOSE")
+                    break;
+            }
+            lease.fOk = true;
+        }
+        CATCH_PRINT_EXCEPTION("BtfResolveMany")
+    }
+    return !out.empty();
+}
+
 
 // Connect to a relay: publish our .btf descriptor and collect relay data.
 static bool SeedFromRelay(CNostrKey& key, const string& relay)
 {
-    CWebSocket ws;
-    if (!ws.Connect(relay, 10))
+    CRelayLease lease(relay, 10);
+    if (!lease.Connected())
         return false;
-    printf("Nostr: connected to %s\n", relay.c_str());
+    CWebSocket& ws = lease.Ws();
+    if (lease.fJustConnected)
+        LogPrint("nostr", "Nostr: connected to %s\n", relay.c_str());
 
     // Publish our self-certifying .btf descriptor (rendezvous discovery)
     PublishDescriptor(ws, key);
@@ -930,7 +1164,7 @@ static bool SeedFromRelay(CNostrKey& key, const string& relay)
                         else if (createdAt > it->second)  it->second = createdAt; // refresh
                     }
                     if (fNew && fDebug)
-                        printf("Nostr: discovered .btf peer %s\n", peerAddr.c_str());
+                        LogPrint("nostr", "Nostr: discovered .btf peer %s\n", peerAddr.c_str());
                     if (++nPeers > 500) break;
                 }
                 else if (type == "EOSE")
@@ -974,7 +1208,7 @@ static bool SeedFromRelay(CNostrKey& key, const string& relay)
                         if (g_discoveredRelays.size() < BTF_MAX_DISCOVERED_RELAYS)
                             fNew = g_discoveredRelays.insert(r).second;
                     if (fNew && fDebug)
-                        printf("Nostr: discovered relay %s\n", r.c_str());
+                        LogPrint("nostr", "Nostr: discovered relay %s\n", r.c_str());
                 }
                 else if (type == "EOSE")
                     break;
@@ -1009,12 +1243,15 @@ static bool SeedFromRelay(CNostrKey& key, const string& relay)
             }
         }
     }
+    lease.fOk = true;
     return true;
 }
 
+volatile bool gAnnounceNow = false;
+
 void ThreadBtfPoolAnnouncer(void*)
 {
-    printf("ThreadBtfPoolAnnouncer started\n");
+    LogPrint("pool", "ThreadBtfPoolAnnouncer started\n");
     while (!fShutdown)
     {
         if (nMineMode == MINE_OPERATOR && gPoolRunning)
@@ -1025,15 +1262,17 @@ void ThreadBtfPoolAnnouncer(void*)
             ann.dashboardUrl = strPoolDashboardUrl;
             ann.feePercent = dPoolFeePercent;
             uint64 roundShares = 0;
-            GetPoolOperatorStats(ann.connectedMiners, ann.blocksFound, roundShares);
-            ann.hashRate = 0.0;
+            double totalHashRate = 0.0;
+            GetPoolOperatorStats(ann.connectedMiners, ann.blocksFound, roundShares, totalHashRate);
+            ann.hashRate = totalHashRate;
             ann.createdAt = GetTime();
             if (!ann.btfAddress.empty() && !ann.poolName.empty())
                 BtfPublishPoolAnnouncement(ann);
         }
 
-        for (int i = 0; i < 60 && !fShutdown; i++)
+        for (int i = 0; i < 60 && !fShutdown && !gAnnounceNow; i++)
             Sleep(1000);
+        gAnnounceNow = false;
     }
 }
 
@@ -1042,9 +1281,28 @@ void ThreadBtfPoolAnnouncer(void*)
 // dead/stale descriptors (e.g. abandoned test identities that linger on the
 // relays) from consuming the whole per-pass dial budget and starving the live
 // peers. Backoff grows on repeated failures, capped.
+//
+// g_btfPeerFails also doubles as the priority signal for dial ordering: a peer
+// we've connected to before (present in g_btfPeerEverConnected) is known-good
+// and goes first; a peer we've never tried goes next; a peer with a growing
+// fail count is known-bad and goes last, worst offenders furthest back. This
+// replaces the old behavior where the whole candidate list was shuffled right
+// after being sorted by freshness, which made the freshness sort a no-op and
+// gave dead peers equal footing with everyone else.
 static map<string, int64> g_btfPeerBackoff;   // addr -> next-try time
 static map<string, int>   g_btfPeerFails;      // addr -> consecutive failures
+static set<string>        g_btfPeerEverConnected; // addr -> has succeeded at least once
 static CCriticalSection   cs_btfPeerState;
+
+// Backoff cap for repeatedly-dead peers. The old 15-minute cap meant a
+// descriptor that has failed many times in a row cycles back into the dial
+// pool just as often as a peer we've never tried, wasting dial budget on
+// known-dead addresses every pass. Once a peer has failed enough times to
+// be "chronic", stretch the cap much further so it consumes budget far less
+// often while still getting retried eventually in case it comes back online.
+static const int64 BTF_BACKOFF_CAP_SECS       = 15 * 60;      // 15 min: initial ramp cap
+static const int64 BTF_BACKOFF_CAP_SECS_DEAD  = 6 * 60 * 60;  // 6 hr: cap for chronic failures
+static const int   BTF_CHRONIC_FAIL_THRESHOLD = 6;            // fails before "chronic" cap kicks in
 
 // Dial the .btf peers discovered on the relays, up to a target connection count.
 // Connections are attempted in parallel so a single slow/dead relay doesn't
@@ -1060,23 +1318,18 @@ static void ConnectDiscoveredBtfPeers()
         for (auto& kv : g_btfPeers)
             peersWithAge.push_back({kv.second, kv.first});
     }
-    // Sort newest descriptor first — recently-active nodes are much more
-    // likely to be online right now. Stale ones stay in the list as fallback.
-    sort(peersWithAge.begin(), peersWithAge.end(),
-         [](const pair<int64,string>& a, const pair<int64,string>& b){ return a.first > b.first; });
-
     int64 cutoff = GetTime() - BTF_PEER_MAX_AGE;
     int nFresh = 0;
-    vector<string> peers;
+    vector<pair<int64,string>> fresh; // (createdAt, addr), newest first
     for (auto& p : peersWithAge)
     {
         if (p.first < cutoff)
             continue;
-        peers.push_back(p.second);
+        fresh.push_back(p);
         nFresh++;
     }
-    if (!peers.empty())
-        printf("Nostr: %d fresh peers, %d stale (of %d total)\n", nFresh, nTotal-nFresh, nTotal);
+    if (!fresh.empty())
+        LogPrint("nostr", "Nostr: %d fresh peers, %d stale (of %d total)\n", nFresh, nTotal-nFresh, nTotal);
 
     // Drop stale peers so we stop retrying dead descriptors until they refresh.
     {
@@ -1092,42 +1345,164 @@ static void ConnectDiscoveredBtfPeers()
         }
     }
 
-    // Shuffle so we don't always retry the same dead peers at the front.
-    for (size_t i = peers.size(); i > 1; i--)
-        swap(peers[i - 1], peers[(size_t)GetRand(i)]);
+    // Sort newest descriptor first -- recently-active nodes are much more
+    // likely to be online right now.
+    sort(fresh.begin(), fresh.end(),
+         [](const pair<int64,string>& a, const pair<int64,string>& b){ return a.first > b.first; });
 
-    // Pick candidates for this pass (skip those in backoff, cap at budget).
-    int64 now = GetTime();
-    vector<string> candidates;
+    // Reorder into tiers: known-good (succeeded before) first, untried next,
+    // known-bad (has a fail count) last -- worst offenders furthest back.
+    // Freshness order is preserved *within* each tier, so recency still
+    // matters, but a peer we know is dead no longer gets equal footing with
+    // a peer we've never tried or one that's worked before.
+    vector<string> tierGood, tierUntried, tierBad;
     CRITICAL_BLOCK(cs_btfPeerState)
     {
+        for (auto& p : fresh)
+        {
+            const string& addr = p.second;
+            if (g_btfPeerEverConnected.count(addr))
+                tierGood.push_back(addr);
+            else if (g_btfPeerFails.find(addr) == g_btfPeerFails.end())
+                tierUntried.push_back(addr);
+            else
+                tierBad.push_back(addr);
+        }
+        // Within known-bad, put fewer-fails peers ahead of chronic offenders.
+        sort(tierBad.begin(), tierBad.end(),
+             [](const string& a, const string& b){ return g_btfPeerFails[a] < g_btfPeerFails[b]; });
+    }
+
+    vector<string> peers;
+    peers.reserve(fresh.size());
+    peers.insert(peers.end(), tierGood.begin(), tierGood.end());
+    peers.insert(peers.end(), tierUntried.begin(), tierUntried.end());
+    peers.insert(peers.end(), tierBad.begin(), tierBad.end());
+
+    // Pick candidates for this pass (skip those in backoff, cap at budget).
+    //
+    // The tiered order above is deliberately biased toward peers we know
+    // are good -- that's the right default, since dialing untested/bad
+    // peers wastes attempts. But if every node on the network applies the
+    // same bias, everyone converges on the same small set of "known good"
+    // peers as neighbors: that correlates peer sets across the network,
+    // which is exactly what standard random-graph connectivity results
+    // assume you avoid. If that shared hub set has a bad day (e.g. one
+    // relay outage), many nodes lose the same edges at once instead of
+    // losing independent, uncorrelated edges.
+    //
+    // So: fill most of the pass from the reliable/tiered order, but reserve
+    // a slice for peers picked at random from the *entire* fresh pool
+    // (not just the front of the sorted list). Same pattern Bitcoin's own
+    // peer manager and Kademlia-style DHTs use -- sticky reliable peers
+    // plus a random sample, not one or the other.
+    int64 now = GetTime();
+    int nBudget = (int)BTF_DIALS_PER_PASS;
+    {
+        int nRoom = (int)BTF_TARGET_CONN - (int)vNodes.size();
+        if (nRoom < nBudget) nBudget = nRoom;
+    }
+    if (nBudget < 0) nBudget = 0;
+    int nRandomSlots = (nBudget > 0) ? max(1, nBudget * 3 / 10) : 0;
+    int nSortedSlots = nBudget - nRandomSlots;
+
+    vector<string> candidates;
+    set<string> setChosen;
+    CRITICAL_BLOCK(cs_btfPeerState)
+    {
+        // Reliability slice: walk the tiered (good -> untried -> bad) order.
         for (const string& addr : peers)
         {
             if ((int)vNodes.size() >= (int)BTF_TARGET_CONN) break;
-            if ((int)candidates.size() >= BTF_DIALS_PER_PASS) break;
+            if ((int)candidates.size() >= nSortedSlots) break;
             map<string, int64>::iterator bi = g_btfPeerBackoff.find(addr);
             if (bi != g_btfPeerBackoff.end() && now < bi->second)
                 continue;
             candidates.push_back(addr);
+            setChosen.insert(addr);
+        }
+
+        // Diversity slice: random sample from the full fresh pool, so the
+        // dial isn't limited to whatever the tiered sort put up front.
+        vector<string> pool;
+        for (auto& p : fresh)
+        {
+            const string& addr = p.second;
+            if (setChosen.count(addr))
+                continue;
+            map<string, int64>::iterator bi = g_btfPeerBackoff.find(addr);
+            if (bi != g_btfPeerBackoff.end() && now < bi->second)
+                continue;
+            pool.push_back(addr);
+        }
+        int nWant = min(nRandomSlots, (int)pool.size());
+        for (int i = 0; i < nWant; i++)
+        {
+            if ((int)vNodes.size() + (int)candidates.size() >= (int)BTF_TARGET_CONN) break;
+            if ((int)candidates.size() >= nBudget) break;
+            size_t j = i + (size_t)GetRand((uint64)(pool.size() - i));
+            std::swap(pool[i], pool[j]);
+            candidates.push_back(pool[i]);
+            setChosen.insert(pool[i]);
         }
     }
 
     if (candidates.empty()) return;
 
-    // Launch one thread per candidate — all connect attempts run in parallel.
-    // Each thread writes its result back via shared state guarded by cs_btfPeerState.
-    struct DialCtx { string addr; };
-    vector<DialCtx*> ctxs;
-    for (const string& addr : candidates)
+    // Resolve every candidate's descriptor in one batched pass (a handful of
+    // relay round-trips total, one REQ per relay covering all candidates)
+    // instead of each dial thread independently walking the relay list on
+    // its own. That per-thread approach meant a 12-candidate pass could fire
+    // up to 12 * nNostrRelays near-simultaneous connections at the same
+    // handful of public relays -- enough to trip rate limits or get
+    // handshakes refused, which then looks exactly like "dead peers" even
+    // though the descriptors were perfectly resolvable.
+    map<string, BtfResolvedPeer> resolved;
+    BtfResolveMany(candidates, resolved);
+
+    // Candidates whose descriptor didn't resolve this pass are recorded as a
+    // failure right away (no point spawning a tunnel thread with nothing to
+    // dial), same bookkeeping as a failed connect attempt.
+    vector<string> toDial;
+    CRITICAL_BLOCK(cs_btfPeerState)
     {
-        DialCtx* ctx = new DialCtx{addr};
+        for (const string& addr : candidates)
+        {
+            if (resolved.count(addr))
+            {
+                toDial.push_back(addr);
+                continue;
+            }
+            int n = ++g_btfPeerFails[addr];
+            int64 cap = (n >= BTF_CHRONIC_FAIL_THRESHOLD) ? BTF_BACKOFF_CAP_SECS_DEAD
+                                                           : BTF_BACKOFF_CAP_SECS;
+            int64 secs = 30;
+            for (int k = 1; k < n && secs < cap; k++) secs *= 2;
+            if (secs > cap) secs = cap;
+            g_btfPeerBackoff[addr] = GetTime() + secs;
+        }
+    }
+    if (toDial.empty()) return;
+
+    // Launch one thread per resolved candidate -- all connect attempts run in
+    // parallel, but purely against each peer's own rendezvous meeting node,
+    // not the shared Nostr relays, so there's no thundering-herd effect here.
+    // Each thread writes its result back via shared state guarded by cs_btfPeerState.
+    struct DialCtx { string addr; BtfResolvedPeer rp; };
+    vector<DialCtx*> ctxs;
+    for (const string& addr : toDial)
+    {
+        DialCtx* ctx = new DialCtx{addr, resolved[addr]};
         ctxs.push_back(ctx);
         _beginthread([](void* arg) {
             DialCtx* ctx = (DialCtx*)arg;
             string addr = ctx->addr;
+            string meeting = ctx->rp.meetingHostPort;
+            unsigned char enc_pub[32];
+            memcpy(enc_pub, ctx->rp.enc_pub, 32);
             delete ctx;
 
-            CNode* pnode = ConnectNodeBtf(addr);
+            CNode* pnode = ConnectNodeBtfResolved(addr, meeting, enc_pub);
             CRITICAL_BLOCK(cs_btfPeerState)
             {
                 if (pnode)
@@ -1138,13 +1513,16 @@ static void ConnectDiscoveredBtfPeers()
                         pnode->Release();
                     g_btfPeerBackoff.erase(addr);
                     g_btfPeerFails.erase(addr);
+                    g_btfPeerEverConnected.insert(addr);
                 }
                 else
                 {
                     int n = ++g_btfPeerFails[addr];
+                    int64 cap = (n >= BTF_CHRONIC_FAIL_THRESHOLD) ? BTF_BACKOFF_CAP_SECS_DEAD
+                                                                   : BTF_BACKOFF_CAP_SECS;
                     int64 secs = 30;
-                    for (int k = 1; k < n && secs < 15*60; k++) secs *= 2;
-                    if (secs > 15*60) secs = 15*60;
+                    for (int k = 1; k < n && secs < cap; k++) secs *= 2;
+                    if (secs > cap) secs = cap;
                     g_btfPeerBackoff[addr] = GetTime() + secs;
                 }
             }
@@ -1160,16 +1538,16 @@ static void ConnectDiscoveredBtfPeers()
 
 void ThreadNostrSeed(void* parg)
 {
-    printf("ThreadNostrSeed started\n");
+    LogPrint("nostr", "ThreadNostrSeed started\n");
 
     if (!EnsureNostrKey())
     {
-        printf("Nostr: failed to initialize secp256k1 key\n");
+        LogPrint("nostr", "Nostr: failed to initialize secp256k1 key\n");
         return;
     }
     CNostrKey& key = g_nostrKey;
-    printf("Nostr: node pubkey = %s\n", key.PubKeyHex().c_str());
-    printf("Nostr: node .btf address = %s\n", key.BtfAddress().c_str());
+    LogPrint("nostr", "Nostr: node pubkey = %s\n", key.PubKeyHex().c_str());
+    LogPrint("nostr", "Nostr: node .btf address = %s\n", key.BtfAddress().c_str());
 
     // One-time self-test of the rendezvous: publish our descriptor to a relay,
     // then resolve our OWN .btf address back and verify it self-certifies. Proves
@@ -1178,17 +1556,20 @@ void ThreadNostrSeed(void* parg)
     {
         try
         {
-            CWebSocket ws;
-            if (!ws.Connect(pszNostrRelays[i], 10)) continue;
+            CRelayLease lease(pszNostrRelays[i], 10);
+            if (!lease.Connected()) continue;
+            CWebSocket& ws = lease.Ws();
             PublishDescriptor(ws, key);
             Sleep(700); // let the relay store the replaceable event
             btf::Descriptor d;
             if (ResolveDescriptor(ws, key.ctx, key.BtfAddress(), d))
             {
-                printf("Nostr: .btf self-resolve OK via %s (meeting_node=%s, enc=%s...)\n",
+                LogPrint("nostr", "Nostr: .btf self-resolve OK via %s (meeting_node=%s, enc=%s...)\n",
                        pszNostrRelays[i], d.meeting_node.c_str(), d.enc.substr(0, 16).c_str());
+                lease.fOk = true;
                 break;
             }
+            lease.fOk = true;
         }
         CATCH_PRINT_EXCEPTION("btf self-test")
     }
@@ -1223,8 +1604,9 @@ void ThreadNostrSeed(void* parg)
             ann.dashboardUrl = strPoolDashboardUrl;
             ann.feePercent = dPoolFeePercent;
             uint64 roundShares = 0;
-            GetPoolOperatorStats(ann.connectedMiners, ann.blocksFound, roundShares);
-            ann.hashRate = 0.0;
+            double totalHashRate = 0.0;
+            GetPoolOperatorStats(ann.connectedMiners, ann.blocksFound, roundShares, totalHashRate);
+            ann.hashRate = totalHashRate;
             ann.createdAt = GetTime();
             if (!ann.btfAddress.empty() && !ann.poolName.empty())
                 BtfPublishPoolAnnouncement(ann);

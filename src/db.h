@@ -316,19 +316,8 @@ private:
 
 
 
-class CAddrDB : public CDB
-{
-public:
-    CAddrDB(const char* pszMode="r+", bool fTxn=false) : CDB("addr.dat", pszMode, fTxn) { }
-private:
-    CAddrDB(const CAddrDB&);
-    void operator=(const CAddrDB&);
-public:
-    bool WriteAddress(const CAddress& addr);
-    bool LoadAddresses();
-};
-
-bool LoadAddresses();
+// Legacy IP-based peer address database (CAddrDB / addr.dat) removed --
+// peer discovery is entirely Nostr/.btf-based now.
 
 
 

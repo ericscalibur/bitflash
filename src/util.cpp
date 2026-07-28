@@ -8,6 +8,99 @@
 
 bool fDebug = false;
 
+// ---------------------------------------------------------------------------
+// Categorized, burst-collapsing logging -- see the LogPrint doc comment in
+// util.h for the problem this solves.
+// ---------------------------------------------------------------------------
+
+// Categories that explain the pool/worker/payout pipeline are on unconditionally:
+// silence there is exactly the "worker stuck, nothing then happens" complaint
+// this exists to fix, so it can't be opted out of by forgetting -debug.
+// "net" and "nostr" cover the per-address connection/discovery chatter that
+// used to dominate debug.log; they're gated behind fDebug like the printf()
+// calls they replace, so default output stays quiet unless requested.
+static bool LogCategoryDefaultOn(const char* category)
+{
+    return strcmp(category, "pool")   == 0 ||
+           strcmp(category, "worker") == 0 ||
+           strcmp(category, "payout") == 0;
+}
+
+bool LogAcceptsCategory(const char* category)
+{
+    if (LogCategoryDefaultOn(category))
+        return true;
+    return fDebug;
+}
+
+// Only collapse bursts from the exact same call site within this window;
+// a different LogPrint() call (different file/line) is never merged with
+// this one, so unrelated messages never get mixed into one summary.
+static const int64 DEDUP_WINDOW_SECS = 3;
+
+struct LogDedupState {
+    int64       windowStart;   // GetTime() when the current window opened
+    int         suppressed;    // calls swallowed so far this window
+    std::string lastMsg;       // most recent message text, for the summary line
+};
+
+static std::map<std::string, LogDedupState> g_logDedup;
+static CCriticalSection cs_logDedup;
+
+void LogPrintDedup(const char* category, const char* file, int line, const std::string& msgIn)
+{
+    // Call sites follow the existing printf() convention of ending their
+    // format string with \n; strip it here so the single \n this function
+    // adds below doesn't turn into a blank line.
+    std::string msg = msgIn;
+    while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r'))
+        msg.pop_back();
+
+    char key[512];
+    my_snprintf(key, sizeof(key), "%s|%s:%d", category, file, line);
+
+    int64 now = GetTime();
+    bool  fEmitNow = false;
+    int   suppressedToFlush = 0;
+    std::string flushedMsg;
+
+    CRITICAL_BLOCK(cs_logDedup)
+    {
+        std::map<std::string, LogDedupState>::iterator it = g_logDedup.find(key);
+        if (it == g_logDedup.end())
+        {
+            // First time this call site has fired (or its last window is long
+            // gone) -- print it directly and open a fresh window.
+            g_logDedup[key] = LogDedupState{now, 0, msg};
+            fEmitNow = true;
+        }
+        else if (now - it->second.windowStart >= DEDUP_WINDOW_SECS)
+        {
+            // Window rolled over: flush what was suppressed during it (if
+            // anything), then start a new window with this call printed.
+            suppressedToFlush = it->second.suppressed;
+            flushedMsg = it->second.lastMsg;
+            it->second.windowStart = now;
+            it->second.suppressed  = 0;
+            it->second.lastMsg     = msg;
+            fEmitNow = true;
+        }
+        else
+        {
+            // Still inside the window and already printed one line for it:
+            // count this occurrence instead of writing another near-duplicate.
+            it->second.suppressed++;
+            it->second.lastMsg = msg;
+        }
+    }
+
+    if (suppressedToFlush > 0)
+        OutputDebugStringF("[%s] (%d similar in %llds, last: %s)\n",
+                            category, suppressedToFlush, (long long)DEDUP_WINDOW_SECS, flushedMsg.c_str());
+    if (fEmitNow)
+        OutputDebugStringF("[%s] %s\n", category, msg.c_str());
+}
+
 
 
 
@@ -200,11 +293,16 @@ void PrintException(std::exception* pex, const char* pszThread)
         snprintf(pszMessage, sizeof(pszMessage),
             "UNKNOWN EXCEPTION       \n%s in %s       \n", pszModule, pszThread);
     printf("\n\n************************\n%s", pszMessage);
-    // Suppress the dialog and rethrow during shutdown — threads unwinding on
-    // exit cause spurious "UNKNOWN EXCEPTION" popups that aren't real errors.
-    // Show error in GUI via repaint signal — GUI polls g_errorMessage
-    if (!fShutdown)
-        throw;
+    // Do NOT rethrow here. Every caller of PrintException (via
+    // CATCH_PRINT_EXCEPTION) is a thread wrapped in its own
+    // "try { ThreadFoo2() } catch(...) { log, sleep, loop again }" self-healing
+    // retry loop -- that's the whole point of the wrapper. Rethrowing from
+    // inside that catch block escapes the retry loop entirely (nothing above
+    // it in the thread catches it) and takes down the whole process with
+    // std::terminate() on the very first transient error -- a flaky relay
+    // connection, a malformed message, anything -- instead of letting the
+    // thread log it, sleep 5s, and try again like it's designed to.
+    // Show error in GUI via repaint signal -- GUI polls g_errorMessage
 }
 
 
