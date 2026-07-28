@@ -678,7 +678,10 @@ static void DrawAboutDialog()
 // ---------------------------------------------------------------------------
 int RunGUI(int argc, char* argv[])
 {
-    if (!glfwInit()) return 1;
+    if (!glfwInit()) {
+        printf("GUI ERROR: glfwInit() failed -- no display or GL available. Run headless with -nogui.\n");
+        return 1;
+    }
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
@@ -687,7 +690,13 @@ int RunGUI(int argc, char* argv[])
 #endif
 
     GLFWwindow* window = glfwCreateWindow(960, 640, "Bitflash", nullptr, nullptr);
-    if (!window) { glfwTerminate(); return 1; }
+    if (!window) {
+        printf("GUI ERROR: could not create an OpenGL 3.3 window.\n");
+        printf("           Your GPU/driver may not support OpenGL 3.3 core -- common over Remote Desktop, in VMs, or on old GPUs.\n");
+        printf("           Fixes: update graphics drivers, use a software OpenGL (Mesa), or run headless with -nogui.\n");
+        glfwTerminate();
+        return 1;
+    }
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
 
