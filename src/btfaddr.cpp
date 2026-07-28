@@ -214,35 +214,47 @@ bool VerifyDescriptor(void* ctxv, const std::string& jsonStr,
                       const unsigned char expect_pubkey[32], Descriptor& out)
 {
     secp256k1_context* ctx = (secp256k1_context*)ctxv;
-    json v;
-    try { v = json::parse(jsonStr); } catch (...) { return false; }
-    if (!v.is_object()) return false;
-    if (!v.contains("pubkey") || !v.contains("enc") || !v.contains("meeting_node")
-        || !v.contains("created") || !v.contains("sig")) return false;
+    // Descriptors arrive from untrusted peers (via Nostr relays). Guard the whole
+    // parse: a malformed or wrong-typed field must be rejected, never throw.
+    try
+    {
+        json v = json::parse(jsonStr);
+        if (!v.is_object()) return false;
+        if (!v.contains("pubkey") || !v.contains("enc") || !v.contains("meeting_node")
+            || !v.contains("created") || !v.contains("sig")) return false;
+        // Reject wrong field types before extracting (json::get would otherwise throw).
+        if (!v["pubkey"].is_string() || !v["enc"].is_string() ||
+            !v["meeting_node"].is_string() || !v["sig"].is_string() ||
+            !v["created"].is_number_unsigned()) return false;
 
-    unsigned char pubkey[32];
-    if (!HexDecode(v["pubkey"].get<std::string>(), pubkey, 32)) return false;
-    if (memcmp(pubkey, expect_pubkey, 32) != 0) return false; // descriptor is for a different key
+        unsigned char pubkey[32];
+        if (!HexDecode(v["pubkey"].get<std::string>(), pubkey, 32)) return false;
+        if (memcmp(pubkey, expect_pubkey, 32) != 0) return false; // descriptor is for a different key
 
-    std::string enc          = v["enc"].get<std::string>();
-    std::string meeting_node = v["meeting_node"].get<std::string>();
-    uint64_t    created      = v["created"].get<uint64_t>();
+        std::string enc          = v["enc"].get<std::string>();
+        std::string meeting_node = v["meeting_node"].get<std::string>();
+        uint64_t    created      = v["created"].get<uint64_t>();
 
-    unsigned char sig[64];
-    if (!HexDecode(v["sig"].get<std::string>(), sig, 64)) return false;
+        unsigned char sig[64];
+        if (!HexDecode(v["sig"].get<std::string>(), sig, 64)) return false;
 
-    unsigned char digest[32];
-    DescriptorDigest(expect_pubkey, enc, meeting_node, created, digest);
+        unsigned char digest[32];
+        DescriptorDigest(expect_pubkey, enc, meeting_node, created, digest);
 
-    secp256k1_xonly_pubkey xpub;
-    if (!secp256k1_xonly_pubkey_parse(ctx, &xpub, expect_pubkey)) return false;
-    if (!secp256k1_schnorrsig_verify(ctx, sig, digest, 32, &xpub)) return false;
+        secp256k1_xonly_pubkey xpub;
+        if (!secp256k1_xonly_pubkey_parse(ctx, &xpub, expect_pubkey)) return false;
+        if (!secp256k1_schnorrsig_verify(ctx, sig, digest, 32, &xpub)) return false;
 
-    memcpy(out.pubkey, expect_pubkey, 32);
-    out.enc = enc;
-    out.meeting_node = meeting_node;
-    out.created = created;
-    return true;
+        memcpy(out.pubkey, expect_pubkey, 32);
+        out.enc = enc;
+        out.meeting_node = meeting_node;
+        out.created = created;
+        return true;
+    }
+    catch (...)
+    {
+        return false; // malformed / wrong-typed descriptor -> reject, don't crash
+    }
 }
 
 } // namespace btf
