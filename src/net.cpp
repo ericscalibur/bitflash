@@ -414,6 +414,93 @@ static void RememberBtfPeer(const string& strBtfAddr, const string& strMeeting,
     }
 }
 
+//
+// Compiled-in bootstrap seeds.
+//
+// A node with no cache has nothing but the Nostr relays, and if those are down,
+// blocked or simply slow, a first run has no way into the network at all. Seeds
+// are the floor under that: a handful of long-lived peers baked into the binary.
+//
+// A seed entry is deliberately just an address and an encryption key -- no
+// meeting node. The rendezvous relay pairs on the service's public key, and a
+// `.btf` address *is* that key, so a client can find a seed by trying the known
+// relays in turn. Recording which relay a seed was on would rot the moment it
+// failed over, which is the exact failure this project spent a long time
+// chasing: advertising a rendezvous somebody is not registered at.
+//
+// Seeds are ordinary nodes with no special authority. They hand out signed,
+// self-certifying descriptors like any peer, so a hostile seed can stall a
+// bootstrap but cannot forge a peer or feed a false chain.
+//
+struct BtfSeed
+{
+    const char* btfAddr;
+    const char* encHex;   // 64 hex chars, the peer's x25519 public key
+};
+
+static const BtfSeed pszBtfSeeds[] =
+{
+    // Dedicated bootstrap node, Almaty. Runs beside a rendezvous relay on the
+    // same host, holds no wallet balance and does not mine -- it exists only to
+    // answer a first dial. It is trusted for nothing: it serves the same signed
+    // descriptors any peer does.
+    { "ygffz37jczlmrkzicxok6chobauyratdexc7hfgwzjdabzvb2nkngqy.btf",
+      "de8284b9d4effa2132e7981b566c1a297c39c1857d9c128e8ae093ef511d3200" },
+};
+static const size_t nBtfSeeds = ARRAYLEN(pszBtfSeeds);
+
+// Extra seeds from the command line (/btfseed=ADDRESS:ENCHEX, repeatable).
+vector<pair<string, string> > vBtfExtraSeeds;
+
+static int TryBtfSeeds()
+{
+    vector<pair<string, string> > seeds;
+    for (size_t i = 0; i < nBtfSeeds; i++)
+        seeds.push_back(make_pair(string(pszBtfSeeds[i].btfAddr),
+                                  string(pszBtfSeeds[i].encHex)));
+    foreach(const PAIRTYPE(string, string)& s, vBtfExtraSeeds)
+        seeds.push_back(s);
+
+    if (seeds.empty())
+        return 0;
+
+    vector<string> relays = BtfAllRelays();
+    if (relays.empty())
+        return 0;
+
+    LogPrint("net", "btfseed: trying %zu seed(s) across %zu relay(s)\n",
+             seeds.size(), relays.size());
+
+    int nConnected = 0;
+    foreach(const PAIRTYPE(string, string)& s, seeds)
+    {
+        if (fShutdown) return nConnected;
+        unsigned char enc[32];
+        if (!HexToBytes(s.second, enc, 32))
+        {
+            LogPrint("net", "btfseed: %s has a malformed encryption key, skipped\n",
+                     s.first.c_str());
+            continue;
+        }
+        // We do not know which relay this seed is registered at, so walk them.
+        foreach(const string& strRelay, relays)
+        {
+            if (fShutdown) return nConnected;
+            if (ConnectNodeBtfResolved(s.first, strRelay, enc))
+            {
+                LogPrint("net", "btfseed: reached %s via %s\n",
+                         s.first.c_str(), strRelay.c_str());
+                nConnected++;
+                break;  // found it; no need to try this seed's other relays
+            }
+        }
+        if (nConnected >= 4)
+            break;      // enough of a foothold; the rest comes from discovery
+    }
+    LogPrint("net", "btfseed: %d seed(s) answered\n", nConnected);
+    return nConnected;
+}
+
 // Dial everything we reached last time, before the relays have said anything.
 void ThreadReconnectCachedBtfPeers(void* parg)
 {
@@ -421,7 +508,11 @@ void ThreadReconnectCachedBtfPeers(void* parg)
     LoadCachedBtfPeers(peers);
     if (peers.empty())
     {
-        LogPrint("net", "btfpeers: no cache yet, waiting on relay discovery\n");
+        // First run, or the cache aged out. Seeds are the only way in that does
+        // not depend on a relay answering.
+        LogPrint("net", "btfpeers: no cache yet, falling back to seeds\n");
+        if (TryBtfSeeds() == 0)
+            LogPrint("net", "btfpeers: no seed answered, waiting on relay discovery\n");
         return;
     }
     LogPrint("net", "btfpeers: trying %zu remembered peer(s) before discovery\n",

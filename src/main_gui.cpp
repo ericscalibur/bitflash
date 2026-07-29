@@ -61,6 +61,7 @@ static void PrintUsage()
     printf("\n");
     printf("Network:\n");
     printf("  /port=N                    (P2P listen port, default 8433)\n");
+    printf("  /btfseed=ADDRESS:ENCHEX    (extra bootstrap peer, repeatable)\n");
     printf("\n");
     printf("Each option also accepts '-' instead of '/'.\n");
 }
@@ -116,6 +117,25 @@ static void ParseStartupArguments(int argc, char* argv[])
     string announceRelay = argval2(argc, argv, "/announcerelay", "-announcerelay");
     if (!announceRelay.empty())
         strBtfAnnounceRelay = announceRelay;
+
+    // /btfseed=ADDRESS:ENCHEX -- extra bootstrap peers, repeatable. Useful for
+    // testing the seed path and for private networks that ship no compiled list.
+    for (int i = 1; i < argc; i++)
+    {
+        string s = argv[i];
+        size_t eq = s.find('=');
+        if (eq == string::npos) continue;
+        string key = s.substr(0, eq);
+        if (key != "/btfseed" && key != "-btfseed") continue;
+        string val = s.substr(eq + 1);
+        size_t colon = val.rfind(':');
+        if (colon == string::npos || colon + 1 >= val.size())
+        {
+            fprintf(stderr, "Ignoring %s: expected ADDRESS:ENCHEX\n", s.c_str());
+            continue;
+        }
+        vBtfExtraSeeds.push_back(make_pair(val.substr(0, colon), val.substr(colon + 1)));
+    }
 
     // net.cpp has described nListenPort as "tunable via /port" since it was
     // written, but nothing ever read the option, so the port was fixed at 8433

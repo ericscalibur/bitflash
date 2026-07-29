@@ -29,6 +29,9 @@ CNode* ConnectNodeBtfResolved(const string& strBtfAddr, const string& strMeeting
 void ThreadBtfAccept(void* parg);
 void ThreadBtfConnect(void* parg);
 extern string strBtfConnect;
+// Bootstrap seeds added at runtime with /btfseed=ADDRESS:ENCHEX (repeatable).
+// The compiled-in list lives in net.cpp; these are appended to it.
+extern std::vector<std::pair<std::string, std::string> > vBtfExtraSeeds;
 
 // --- .btf peer exchange ---------------------------------------------------
 // Peers gossip signed descriptors so discovery survives a relay outage. Both
