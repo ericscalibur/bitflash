@@ -59,6 +59,9 @@ static void PrintUsage()
     printf("  /rvrelay=HOST:PORT\n");
     printf("  /announcerelay=HOST:PORT\n");
     printf("\n");
+    printf("Network:\n");
+    printf("  /port=N                    (P2P listen port, default 8433)\n");
+    printf("\n");
     printf("Each option also accepts '-' instead of '/'.\n");
 }
 
@@ -113,6 +116,23 @@ static void ParseStartupArguments(int argc, char* argv[])
     string announceRelay = argval2(argc, argv, "/announcerelay", "-announcerelay");
     if (!announceRelay.empty())
         strBtfAnnounceRelay = announceRelay;
+
+    // net.cpp has described nListenPort as "tunable via /port" since it was
+    // written, but nothing ever read the option, so the port was fixed at 8433
+    // and a second node could not start on a machine already running one.
+    string strPort = argval2(argc, argv, "/port", "-port");
+    if (!strPort.empty())
+    {
+        int nPort = atoi(strPort.c_str());
+        if (nPort <= 0 || nPort > 65535)
+            fprintf(stderr, "Ignoring /port=%s: not a port number\n", strPort.c_str());
+        else
+        {
+            nListenPort = htons((unsigned short)nPort);
+            // Or we would announce a port we never bound.
+            addrLocalHost.port = nListenPort;
+        }
+    }
 }
 
 int main(int argc, char* argv[])
