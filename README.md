@@ -22,19 +22,50 @@ Bitflash keeps Satoshi's original consensus rules and replaces two things:
 
 **RandomX proof of work.** Memory-hard algorithm used by Monero. A laptop competes equally with a server. ASICs and GPUs have no advantage.
 
-**Anonymous addressing.** Every node has a `.btf` address derived from its public key, similar to a Tor `.onion`. Nodes find each other through Nostr relays and connect via encrypted rendezvous tunnels. Your IP is never exposed to other nodes, and no port forwarding is needed.
+**Anonymous addressing.** Every node has a `.btf` address derived from its public key, similar to a Tor `.onion`. Nodes reach each other through encrypted rendezvous tunnels, so no port forwarding is needed and a node behind CGNAT works normally.
 
 No premine. No ICO. 50 BTF per block, halving on schedule, 21M cap, ~2 minute blocks.
+
+### What `.btf` does and does not hide
+
+Worth being precise, because the difference matters if you are relying on it.
+
+**A peer you reach over `.btf` does not learn your IP.** All outbound connections go through a rendezvous tunnel; there is no IP-based peer dialling left in the node. The relay forwards encrypted bytes and cannot read or alter them.
+
+**The rendezvous relay does see your IP.** It has to — it is the thing your TCP connection terminates on. Relays are run by volunteers, so treat that as a party who knows you are on the network.
+
+**The node still listens on 8433.** Nothing dials by IP any more, but the listener is still there, so anyone who already knows your address and can reach that port may connect directly. If that matters to you, firewall it.
+
+This is unlinkability between peers, not anonymity against a network observer. It is not Tor.
 
 ---
 
 ## Quick start
 
-Download the latest release and run. No install, no configuration — it connects automatically and starts syncing.
+Download the [latest release](../../releases/latest) and run. No install, no
+configuration — it connects automatically and starts syncing.
 
-**Linux:** `Bitflash-1.1.0-x86_64.AppImage` — make executable and run.
+**Linux:** make the `.AppImage` executable and run it.
 
-**Windows:** Extract `Bitflash-1.1.0-windows.zip` and run `Bitflash.exe`.
+**Windows:** extract the `-windows.zip` and run `Bitflash.exe`.
+
+Every release ships a `SHA256SUMS` covering both assets. Verifying takes a second
+and is worth doing:
+
+```bash
+sha256sum -c SHA256SUMS
+```
+
+**Keep your node current.** Consensus rules have changed since the first
+releases — 1.2.1 fixed a bug that let anyone spend anyone's coins, and 1.2.2
+added a per-block signature-operation cap. A node on an older build will accept
+blocks that current nodes reject, which puts it on a different chain without any
+warning.
+
+Your wallet and chain data live in `%APPDATA%\Bitflash` (Windows) or
+`~/.bitflash` (Linux) and are shared by every version, so upgrading is just
+replacing the binary. Never delete that directory to "fix" something without a
+backup — it holds your keys.
 
 ---
 
@@ -63,9 +94,26 @@ xmrig -a rx/0 -o POOL_BTF_ADDRESS -u YOUR_BTF_ADDRESS -p x
 
 ```bash
 ./bitflash /nogui                     # node only
+./bitflash /nogui /gen                # node + solo mining
 ./bitflash /nogui /gen /operator      # pool operator
 ./bitflash /nogui /gen /participant=POOL_BTF_ADDRESS  # mine to pool
 ```
+
+Mining is off unless you pass `/gen` — it is not remembered between restarts, so
+put the flag in whatever starts the node rather than enabling it in the window.
+
+Other options worth knowing:
+
+```bash
+/datadir=PATH    # wallet and chain data elsewhere
+/port=N          # P2P listen port, default 8433
+/debug           # verbose log; without it debug.log is nearly silent
+/help            # full list
+```
+
+`/port` plus `/datadir` is what lets two nodes share one machine. Both are
+needed — the data directory takes an exclusive lock, so a second node pointed at
+the same one will refuse to start.
 
 As a systemd service:
 
@@ -83,6 +131,31 @@ WorkingDirectory=/opt/bitflash
 [Install]
 WantedBy=multi-user.target
 ```
+
+---
+
+## How nodes find each other
+
+A node publishes a **self-certifying descriptor**: its `.btf` address, an
+encryption key, and the rendezvous relay where it is currently reachable, signed
+with the key the address decodes to. Nobody can publish a descriptor for an
+address they do not own, so a hostile relay can withhold descriptors but cannot
+forge one.
+
+Discovery runs on four layers, so no single failure takes the network down:
+
+| | |
+|---|---|
+| **Nostr relays** | where descriptors are published and looked up |
+| **Rendezvous relays** | the tunnel itself, where two nodes are paired |
+| **Peer cache** | peers that answered last time, saved to `btfpeers.json` and dialled on start before any relay is contacted |
+| **Peer exchange** | connected nodes hand each other signed descriptors, so discovery keeps working while relays are down |
+
+Peer exchange carries the same signed descriptors, verified the same way, so a
+peer passing one on is trusted for nothing.
+
+The cache is what makes a restart fast: on a clean install the first peer takes
+about 36 seconds, and on the next start about 2.
 
 ---
 
@@ -121,12 +194,21 @@ Installs deps via pacman, produces `Bitflash-*-windows.zip`.
 |---|---|
 | Ticker | BTF |
 | Proof of work | RandomX (CPU, memory-hard) |
-| Block reward | 50 BTF, halving on schedule |
-| Max supply | 21,000,000 BTF |
 | Block time | ~2 minutes |
-| Privacy | `.btf` hidden-service addressing over Nostr |
+| Difficulty retarget | every 30 blocks (~1 hour) |
+| Block reward | 50 BTF, halving every 210,000 blocks |
+| Halving interval | **~292 days** at target block time |
+| Max supply | 21,000,000 BTF |
+| Coinbase maturity | 100 blocks (~3.3 hours) before mined coins can be spent |
+| Max signature ops | 20,000 per block |
+| P2P port | 8433 |
+| Addressing | `.btf` rendezvous — see the caveats above |
 | Premine | None |
 | Pool server | Built-in — `.btf` rendezvous only |
+
+The halving interval is the number most people get wrong coming from Bitcoin.
+Same 210,000 blocks, but at two minutes instead of ten, so it arrives in about
+ten months rather than four years.
 
 ---
 
