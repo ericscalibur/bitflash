@@ -342,6 +342,36 @@ std::string BtfLocalAddress()
     return g_nostrKey.BtfAddress();
 }
 
+// This node's own descriptor, signed and self-certifying -- the same blob
+// PublishDescriptor puts on Nostr, but handed straight to a peer instead.
+//
+// Reads strBtfActiveRelay directly rather than going through BtfActiveRelay():
+// only a rendezvous we actually registered at is worth announcing. Handing out
+// a meeting node we are not reachable at would make every peer that receives
+// it burn a dial, and over peer exchange that mistake travels further than it
+// does over Nostr.
+std::string BtfLocalDescriptor()
+{
+    if (!EnsureNostrKey())
+        return "";
+    string meeting;
+    CRITICAL_BLOCK(cs_activeRelay)
+        meeting = strBtfActiveRelay;
+    if (meeting.empty())
+        return "";
+    return btf::SignDescriptor(g_nostrKey.ctx, g_nostrKey.seckey,
+                               g_nostrKey.EncPubHex(), meeting, (uint64_t)GetTime());
+}
+
+// The shared secp256k1 context, so net.cpp can verify descriptors that arrive
+// from peers. NULL if the identity could not be loaded.
+void* BtfSecpContext()
+{
+    if (!EnsureNostrKey())
+        return NULL;
+    return (void*)g_nostrKey.ctx;
+}
+
 int GetDiscoveredPeerCount()
 {
     int n = 0;

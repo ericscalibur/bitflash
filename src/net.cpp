@@ -285,6 +285,13 @@ struct CachedBtfPeer
     string meeting;
     string encHex;
     int64  lastSeen;
+    // The peer's own signed descriptor, as it announced itself. Kept verbatim
+    // because that signature is what lets us hand this peer on to somebody
+    // else: the receiver checks it against the key the address decodes to and
+    // never has to take our word for anything. Empty for entries learned
+    // before peer exchange existed, or resolved through Nostr -- those are
+    // still dialable, just not relayable.
+    string desc;
 };
 
 static string BtfPeerCachePath() { return GetAppDir() + "/btfpeers.json"; }
@@ -336,6 +343,8 @@ void LoadCachedBtfPeers(vector<CachedBtfPeer>& out)
             p.meeting  = o["meeting"].get<string>();
             p.encHex   = o["enc"].get<string>();
             p.lastSeen = o.value("seen", (int64)0);
+            if (o.contains("desc") && o["desc"].is_string())
+                p.desc = o["desc"].get<string>();
             if (nNow - p.lastSeen > CACHED_BTF_PEER_TTL) continue; // long gone
             out.push_back(p);
         }
@@ -349,22 +358,35 @@ void LoadCachedBtfPeers(vector<CachedBtfPeer>& out)
 
 static CCriticalSection cs_btfPeerCache;
 
+// strDesc is the peer's own signed descriptor when we have it (it announced
+// itself over peer exchange), "" when we only resolved it through Nostr. An
+// empty one never clears a descriptor already on file: dialing a peer we first
+// learned about by exchange must not cost us the ability to pass it on.
 static void RememberBtfPeer(const string& strBtfAddr, const string& strMeeting,
-                            const unsigned char enc_pub[32])
+                            const unsigned char enc_pub[32],
+                            const string& strDesc = string())
 {
     CRITICAL_BLOCK(cs_btfPeerCache)
     {
         vector<CachedBtfPeer> peers;
         LoadCachedBtfPeers(peers);
 
+        string strKeepDesc = strDesc;
         for (size_t i = 0; i < peers.size(); i++)
-            if (peers[i].btfAddr == strBtfAddr) { peers.erase(peers.begin() + i); break; }
+            if (peers[i].btfAddr == strBtfAddr)
+            {
+                if (strKeepDesc.empty())
+                    strKeepDesc = peers[i].desc;
+                peers.erase(peers.begin() + i);
+                break;
+            }
 
         CachedBtfPeer p;
         p.btfAddr  = strBtfAddr;
         p.meeting  = strMeeting;
         p.encHex   = BytesToHex(enc_pub, 32);
         p.lastSeen = GetTime();
+        p.desc     = strKeepDesc;
         peers.insert(peers.begin(), p); // most recent first
 
         if (peers.size() > MAX_CACHED_BTF_PEERS)
@@ -378,6 +400,8 @@ static void RememberBtfPeer(const string& strBtfAddr, const string& strMeeting,
             o["meeting"] = q.meeting;
             o["enc"]     = q.encHex;
             o["seen"]    = q.lastSeen;
+            if (!q.desc.empty())
+                o["desc"] = q.desc;
             arr.push_back(o);
         }
         FILE* f = fopen(BtfPeerCachePath().c_str(), "w");
@@ -417,6 +441,93 @@ void ThreadReconnectCachedBtfPeers(void* parg)
     }
     LogPrint("net", "btfpeers: %d of %zu remembered peer(s) answered\n",
              nConnected, peers.size());
+}
+
+//
+// .btf peer exchange
+//
+// Until now discovery depended entirely on the Nostr relays: two connected
+// nodes never told each other who else existed, so a relay outage left a
+// running network unable to grow, and a node that found one stale peer had no
+// way to learn there was anything better.
+//
+// What travels here is each peer's own signed descriptor. The receiver checks
+// the Schnorr signature against the key the `.btf` address decodes to, so the
+// sender is trusted for nothing -- forging an entry would need somebody else's
+// secret key. That leaves flooding: valid descriptors for keys the sender
+// generated itself. The caps below bound one message, and the cache prefers
+// peers that actually answered, so a flood costs a Sybil more than it costs us.
+//
+
+void BtfPexCollect(vector<string>& vDescOut)
+{
+    vDescOut.clear();
+
+    // Ours first -- the node on the other end may know nobody but us.
+    string strMine = BtfLocalDescriptor();
+    if (!strMine.empty())
+        vDescOut.push_back(strMine);
+
+    vector<CachedBtfPeer> peers;
+    CRITICAL_BLOCK(cs_btfPeerCache)
+        LoadCachedBtfPeers(peers);
+
+    // Most recently seen first: these answered us, they are not names copied
+    // off a relay listing.
+    foreach(const CachedBtfPeer& p, peers)
+    {
+        if (vDescOut.size() >= MAX_PEX_DESCRIPTORS) break;
+        if (p.desc.empty()) continue;                          // nothing provable to pass on
+        if (p.desc.size() > MAX_PEX_DESCRIPTOR_BYTES) continue;
+        vDescOut.push_back(p.desc);
+    }
+}
+
+int BtfPexAccept(const vector<string>& vDesc)
+{
+    void* ctx = BtfSecpContext();
+    if (!ctx)
+        return 0;
+
+    string strSelf = BtfLocalAddress();
+    int nKept = 0;
+    unsigned int nSeen = 0;
+
+    foreach(const string& strDesc, vDesc)
+    {
+        if (++nSeen > MAX_PEX_DESCRIPTORS) break;
+        if (strDesc.empty() || strDesc.size() > MAX_PEX_DESCRIPTOR_BYTES) continue;
+
+        // The descriptor names the key it belongs to, and taking that key from
+        // the blob is safe precisely because the signature must verify under
+        // it: nobody can produce a valid descriptor for a key they don't hold.
+        unsigned char pubkey[32];
+        try
+        {
+            nlohmann::json v = nlohmann::json::parse(strDesc);
+            if (!v.is_object() || !v.contains("pubkey") || !v["pubkey"].is_string())
+                continue;
+            if (!HexToBytes(v["pubkey"].get<string>(), pubkey, 32))
+                continue;
+        }
+        catch (...) { continue; }   // malformed JSON from an untrusted peer
+
+        btf::Descriptor d;
+        if (!btf::VerifyDescriptor(ctx, strDesc, pubkey, d))
+            continue;
+
+        string strAddr = btf::Address(pubkey);
+        if (strAddr.empty() || strAddr == strSelf)
+            continue;               // ourselves, nothing to learn
+
+        unsigned char enc[32];
+        if (!HexToBytes(d.enc, enc, 32))
+            continue;
+
+        RememberBtfPeer(strAddr, d.meeting_node, enc, strDesc);
+        nKept++;
+    }
+    return nKept;
 }
 
 static CNode* ConnectNodeBtfTail(const string& strBtfAddr, const unsigned char pk[32],
