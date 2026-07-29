@@ -28,7 +28,8 @@ public:
     {
         if (fDbEnvInit)
         {
-            dbenv.close(0);
+            try { dbenv.close(0); }
+            catch (...) { }
             fDbEnvInit = false;
         }
     }
@@ -118,10 +119,10 @@ void CDB::Close()
     if (!vTxn.empty())
         vTxn.front()->abort();
     vTxn.clear();
-    pdb->close(0);
+    try { pdb->close(0); } catch (...) { }
     delete pdb;
     pdb = NULL;
-    dbenv.txn_checkpoint(0, 0, 0);
+    try { dbenv.txn_checkpoint(0, 0, 0); } catch (...) { }
 
     CRITICAL_BLOCK(cs_db)
         --mapFileUseCount[strFile];
@@ -154,8 +155,8 @@ void DBFlush(bool fShutdown)
         {
             char** listp;
             if (mapFileUseCount.empty())
-                dbenv.log_archive(&listp, DB_ARCH_REMOVE);
-            dbenv.close(0);
+                try { dbenv.log_archive(&listp, DB_ARCH_REMOVE); } catch (...) { }
+            try { dbenv.close(0); } catch (...) { }
             fDbEnvInit = false;
         }
     }
@@ -427,7 +428,25 @@ bool CWalletDB::LoadWallet(vector<unsigned char>& vchDefaultKeyRet)
 {
     vchDefaultKeyRet.clear();
 
-    //// todo: shouldn't we catch exceptions and try to recover and continue?
+    // Satoshi's "todo: shouldn't we catch exceptions" sat here since 2009, and
+    // it was not a nicety. Nothing on this path caught anything, so a record
+    // this build could not read -- a wallet from another platform's Berkeley
+    // DB, a truncated file, a field it does not understand -- threw out of
+    // LoadWallet, out of main(), into std::terminate and abort(). On Windows
+    // that surfaces as STATUS_STACK_BUFFER_OVERRUN (0xC0000409) in
+    // ucrtbase.dll: no message, no log line past "Loading wallet...", and a
+    // faulting module that has nothing to do with the actual problem.
+    //
+    // The program knew exactly what had gone wrong and threw the reason away.
+    // Now it says so and stops cleanly, which is the difference between "your
+    // wallet is unreadable and here is why" and a crash nobody can act on.
+    //
+    // Deliberately a hard failure rather than skipping the bad record: a
+    // partially loaded wallet is worse than one that refuses to open, because
+    // the balance looks plausible while keys or transactions are missing.
+    string strLastType;
+    try
+    {
     CRITICAL_BLOCK(cs_mapKeys)
     CRITICAL_BLOCK(cs_mapWallet)
     {
@@ -452,6 +471,7 @@ bool CWalletDB::LoadWallet(vector<unsigned char>& vchDefaultKeyRet)
             // is just the two items serialized one after the other
             string strType;
             ssKey >> strType;
+            strLastType = strType;
             if (strType == "name")
             {
                 string strAddress;
@@ -508,6 +528,21 @@ bool CWalletDB::LoadWallet(vector<unsigned char>& vchDefaultKeyRet)
                 // go stale, nothing to fight over load order.
             }
         }
+    }
+    }
+    catch (const std::exception& e)
+    {
+        printf("LoadWallet: wallet.dat could not be read. Failed while handling "
+               "a '%s' record: %s\n", strLastType.c_str(), e.what());
+        printf("LoadWallet: the file was left untouched. A wallet.dat written by "
+               "a different platform's Berkeley DB is the usual cause.\n");
+        return false;
+    }
+    catch (...)
+    {
+        printf("LoadWallet: wallet.dat could not be read. Unknown failure while "
+               "handling a '%s' record.\n", strLastType.c_str());
+        return false;
     }
 
     printf("nTransactionFee = %lld\n", nTransactionFee);

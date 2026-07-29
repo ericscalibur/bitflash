@@ -170,11 +170,46 @@ int main(int argc, char* argv[])
 
     ParseStartupArguments(argc, argv);
 
-    printf("Loading block index...\n");
+    // Berkeley DB reports failure by throwing, and CDB's constructor lets it
+    // through. Nothing on this path caught anything, so an unreadable
+    // blkindex.dat or wallet.dat -- one written by another platform's Berkeley
+    // DB, a truncated file, a version mismatch -- unwound out of main() into
+    // std::terminate and abort(). On Windows that surfaces as
+    // STATUS_STACK_BUFFER_OVERRUN (0xC0000409) inside ucrtbase.dll: no message,
+    // no log line past "Loading wallet...", and a faulting module with nothing
+    // to do with the real problem. Confirmed by stack trace:
+    //
+    //   libdb_cxx-6.2.dll -> CDB::CDB(...) -> LoadBlockIndex(...) -> main()
+    //
+    // The program knew what had gone wrong and threw the reason away.
     string strErrors;
-    if (!LoadBlockIndex()) { fprintf(stderr,"LoadBlockIndex failed\n"); return 1; }
+    printf("Loading block index...\n");
+    try
+    {
+        if (!LoadBlockIndex()) { fprintf(stderr, "LoadBlockIndex failed\n"); return 1; }
+    }
+    catch (const std::exception& e)
+    {
+        fprintf(stderr, "Cannot read the block index: %s\n", e.what());
+        fprintf(stderr, "blkindex.dat and blk0001.dat may be from another machine or "
+                        "incomplete. Deleting both is safe -- they are re-downloaded -- "
+                        "but never delete wallet.dat, which holds your keys.\n");
+        return 1;
+    }
+
     printf("Loading wallet...\n");
-    if (!LoadWallet())     { fprintf(stderr,"LoadWallet failed\n"); return 1; }
+    try
+    {
+        if (!LoadWallet()) { fprintf(stderr, "LoadWallet failed\n"); return 1; }
+    }
+    catch (const std::exception& e)
+    {
+        fprintf(stderr, "Cannot read wallet.dat: %s\n", e.what());
+        fprintf(stderr, "The file was left untouched. A wallet.dat written by a "
+                        "different platform's Berkeley DB is the usual cause; back it "
+                        "up before trying anything else.\n");
+        return 1;
+    }
     printf("Height=%d\n", nBestHeight);
     ReacceptWalletTransactions();
 
