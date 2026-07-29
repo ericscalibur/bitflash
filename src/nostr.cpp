@@ -100,13 +100,17 @@ vector<string> vBtfMeetingRelays = {
 string strBtfActiveRelay;
 static CCriticalSection cs_activeRelay;
 
+// Only the rendezvous we actually registered at (BtfSetActiveRelay, called from
+// ThreadBtfAccept once registration succeeds). Empty until then, on purpose: it
+// used to fall back to vBtfMeetingRelays[0], and since ThreadNostrSeed and
+// ThreadBtfAccept start in parallel (net.cpp), that fallback is what got
+// published at boot -- a descriptor telling peers to dial a relay we were not
+// registered at. When that first seed was down, every peer that read the
+// descriptor burned a dial on a dead rendezvous.
 string BtfActiveRelay()
 {
     CRITICAL_BLOCK(cs_activeRelay)
-        if (!strBtfActiveRelay.empty())
-            return strBtfActiveRelay;
-    if (!vBtfMeetingRelays.empty())
-        return vBtfMeetingRelays[0];
+        return strBtfActiveRelay;
     return "";
 }
 
@@ -542,7 +546,13 @@ public:
             int n = RawRead(&c, 1);
             if (n <= 0) return error("Nostr: no handshake response from %s", host.c_str());
             resp += c;
-            if (resp.size() > 4096) break;
+            // Bail out instead of breaking: breaking left the socket parked in
+            // the middle of the header block, and since the status line is read
+            // first the " 101 " check below still passed -- so the caller got a
+            // "connected" socket whose next bytes were leftover HTTP, which the
+            // frame parser then read as garbage frames.
+            if (resp.size() > 8192)
+                return error("Nostr: handshake headers too large from %s", host.c_str());
         }
         if (resp.find(" 101 ") == string::npos)
             return error("Nostr: handshake refused by %s", host.c_str());
@@ -749,7 +759,14 @@ static void PublishDescriptor(CWebSocket& ws, CNostrKey& key)
     // (ThreadBtfAccept in net.cpp) is registered at -- where clients dial us.
     string meeting_node = BtfActiveRelay();
     if (meeting_node.empty())
-        meeting_node = "rendezvous-pending";
+    {
+        // Not registered anywhere yet. Publishing now would advertise a meeting
+        // node we can't be reached at, and peers would waste dials on it. The
+        // ThreadNostrSeed loop republishes on every pass, so skipping costs
+        // nothing but the delay until ThreadBtfAccept registers.
+        LogPrint("nostr", "Nostr: skipping descriptor publish, no rendezvous registered yet\n");
+        return;
+    }
     string desc = btf::SignDescriptor(key.ctx, key.seckey, key.EncPubHex(),
                                       meeting_node, (uint64_t)GetTime());
     if (desc.empty())
@@ -1563,6 +1580,13 @@ void ThreadNostrSeed(void* parg)
     CNostrKey& key = g_nostrKey;
     LogPrint("nostr", "Nostr: node pubkey = %s\n", key.PubKeyHex().c_str());
     LogPrint("nostr", "Nostr: node .btf address = %s\n", key.BtfAddress().c_str());
+
+    // The self-test below publishes a real descriptor, and PublishDescriptor now
+    // refuses to publish before ThreadBtfAccept has registered a rendezvous. Give
+    // registration a bounded head start so the test measures the publish/resolve
+    // chain instead of losing the race against it.
+    for (int i = 0; i < 60 && !fShutdown && BtfActiveRelay().empty(); i++)
+        Sleep(1000);
 
     // One-time self-test of the rendezvous: publish our descriptor to a relay,
     // then resolve our OWN .btf address back and verify it self-certifies. Proves

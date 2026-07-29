@@ -34,7 +34,8 @@ extern const int nNostrRelays;
 extern std::vector<std::string> vBtfMeetingRelays;
 // The relay this node is currently registered at (set by ThreadBtfAccept).
 extern std::string strBtfActiveRelay;
-// The active relay, or the first seed if none active yet ("" if the list is empty).
+// The relay we are registered at, or "" if registration hasn't succeeded yet.
+// Never guesses a seed: an unregistered node has no meeting node to advertise.
 std::string BtfActiveRelay();
 // Record the relay this node just registered its service at (thread-safe).
 void BtfSetActiveRelay(const std::string& relay);
