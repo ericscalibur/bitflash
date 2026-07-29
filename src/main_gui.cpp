@@ -58,7 +58,6 @@ static void PrintUsage()
     printf("  /connectbtf=PEER_BTF_ADDRESS\n");
     printf("  /rvrelay=HOST:PORT\n");
     printf("  /announcerelay=HOST:PORT\n");
-    printf("  /port=N                  (P2P listen port, default 8433)\n");
     printf("\n");
     printf("Each option also accepts '-' instead of '/'.\n");
 }
@@ -114,23 +113,6 @@ static void ParseStartupArguments(int argc, char* argv[])
     string announceRelay = argval2(argc, argv, "/announcerelay", "-announcerelay");
     if (!announceRelay.empty())
         strBtfAnnounceRelay = announceRelay;
-
-    // net.cpp has claimed nListenPort was "tunable via /port" since it was
-    // written, but nothing ever read the option. Without it a second node
-    // cannot start on a machine that already runs one -- which is exactly what
-    // testing peer exchange needs.
-    string strPort = argval2(argc, argv, "/port", "-port");
-    if (!strPort.empty())
-    {
-        int nPort = atoi(strPort.c_str());
-        if (nPort <= 0 || nPort > 65535)
-            fprintf(stderr, "Ignoring /port=%s: not a port number\n", strPort.c_str());
-        else
-        {
-            nListenPort = htons((unsigned short)nPort);
-            addrLocalHost.port = nListenPort;  // or we advertise a port we never bound
-        }
-    }
 }
 
 int main(int argc, char* argv[])

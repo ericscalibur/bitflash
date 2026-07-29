@@ -29,21 +29,6 @@ CNode* ConnectNodeBtfResolved(const string& strBtfAddr, const string& strMeeting
 void ThreadBtfAccept(void* parg);
 void ThreadBtfConnect(void* parg);
 extern string strBtfConnect;
-
-// --- .btf peer exchange ---------------------------------------------------
-// Peers gossip signed descriptors so discovery survives a relay outage. Both
-// caps apply to a single "btfpeers" message; the generic header limit is 256 MB,
-// which is no protection at all for something a stranger can send unprompted.
-static const unsigned int MAX_PEX_DESCRIPTORS      = 20;
-static const unsigned int MAX_PEX_DESCRIPTOR_BYTES = 1024;
-// Ignore a peer's exchange more often than this. One announcement per side per
-// connection is the intended traffic; anything faster is someone else's idea.
-static const int64        PEX_MIN_INTERVAL         = 60;
-
-// Descriptors to hand a peer: ours first, then peers that answered us.
-void BtfPexCollect(std::vector<std::string>& vDescOut);
-// Verify descriptors a peer sent and remember the good ones. Returns how many.
-int  BtfPexAccept(const std::vector<std::string>& vDesc);
 void AbandonRequests(void (*fn)(void*, CDataStream&), void* param1);
 bool AnySubscribed(unsigned int nChannel);
 void ThreadBitcoinMiner(void* parg);
@@ -482,9 +467,6 @@ public:
     // publish and subscription
     vector<char> vfSubscribe;
 
-    // Last "btfpeers" we accepted from this node, to rate-limit the exchange.
-    int64 nLastPexRecv;
-
 
     CNode(SOCKET hSocketIn, CAddress addrIn, bool fInboundIn=false)
     {
@@ -501,7 +483,6 @@ public:
         fDisconnect = false;
         nRefCount = 0;
         nReleaseTime = 0;
-        nLastPexRecv = 0;
         vfSubscribe.assign(256, false);
 
         // Push a version message

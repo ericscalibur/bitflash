@@ -1877,14 +1877,6 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
             pfrom->PushMessage("getblocks", CBlockLocator(pindexBest), uint256(0));
         }
 
-        // Introduce ourselves and hand over the .btf peers that answered us.
-        // Everything in here is self-certifying, so this is safe to send to a
-        // node we know nothing about, and safe for it to act on.
-        vector<string> vPexOut;
-        BtfPexCollect(vPexOut);
-        if (!vPexOut.empty())
-            pfrom->PushMessage("btfpeers", vPexOut);
-
         if (LogAcceptsCategory("net")) printf("version addrMe = %s\n", addrMe.ToString().c_str());
     }
 
@@ -1893,29 +1885,6 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
     {
         // Must have a version message before anything else
         return false;
-    }
-
-
-    else if (strCommand == "btfpeers")
-    {
-        // Peer exchange. Nothing here is taken on trust: BtfPexAccept checks
-        // every descriptor's signature against the key its .btf address
-        // decodes to, and drops the rest.
-        int64 nNow = GetTime();
-        if (nNow - pfrom->nLastPexRecv < PEX_MIN_INTERVAL)
-        {
-            if (LogAcceptsCategory("net"))
-                printf("btfpeers: ignoring, %s is sending them too fast\n",
-                       pfrom->addr.ToString().c_str());
-            return true;
-        }
-        pfrom->nLastPexRecv = nNow;
-
-        vector<string> vDesc;
-        vRecv >> vDesc;
-        int nKept = BtfPexAccept(vDesc);
-        LogPrint("net", "btfpeers: kept %d of %zu descriptor(s) from %s\n",
-                 nKept, vDesc.size(), pfrom->addr.ToString().c_str());
     }
 
 

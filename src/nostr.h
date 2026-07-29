@@ -82,14 +82,6 @@ bool BtfGetIdentity(unsigned char pubkey[32], unsigned char enc_sk[32]);
 // This node's printable .btf address, or "" if the identity failed to load.
 std::string BtfLocalAddress();
 
-// This node's own signed descriptor, ready to hand to a peer over the wire.
-// "" until ThreadBtfAccept has registered at a rendezvous.
-std::string BtfLocalDescriptor();
-
-// The shared secp256k1 context, for btf::VerifyDescriptor (which takes it as
-// void* to keep headers free of secp). NULL if the identity failed to load.
-void* BtfSecpContext();
-
 // Resolve a .btf address via the public discovery relays: fetch the owner's
 // self-certified descriptor and return its meeting node ("host:port") and
 // x25519 public key for the end-to-end channel.
