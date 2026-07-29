@@ -250,9 +250,18 @@ RvSocket RvServiceRegister(const char* relay_host, unsigned short port,
     hdr[0] = (unsigned char)'S';
     memcpy(hdr + 1, my_pubkey, 32);
     if (!WriteN(s, hdr, 33)) { CLOSESOCK(s); return RV_INVALID; }
-    unsigned char paired = 0;
-    if (!ReadN(s, &paired, 1) || paired != 0x01) { CLOSESOCK(s); return RV_INVALID; }
+    // Return here: registered, not yet paired. The relay lists the service as
+    // soon as it reads this header. The 0x01 that used to be consumed below
+    // only arrives when somebody dials us, so blocking on it made "registered"
+    // and "already in use" indistinguishable to the caller -- and left the node
+    // unable to advertise a meeting node until after it had been reached there.
     return (RvSocket)s;
+}
+
+bool RvServiceWaitPaired(RvSocket s)
+{
+    unsigned char paired = 0;
+    return ReadN((SOCKET)s, &paired, 1) && paired == 0x01;
 }
 
 RvSocket RvClientConnect(const char* relay_host, unsigned short port,

@@ -554,7 +554,10 @@ void ThreadBtfAccept(void* parg)
         string strHost = strMeeting.substr(0, colon);
         int nPort = atoi(strMeeting.substr(colon + 1).c_str());
 
-        // Blocks until a client is paired to us (or the relay drops us)
+        // Returns as soon as the relay has us listed -- it does not wait for a
+        // dial. That distinction is the whole point: we have to be advertised
+        // before anyone can dial us, so registering and waiting cannot be the
+        // same call.
         btf::RvSocket rv = btf::RvServiceRegister(strHost.c_str(), (unsigned short)nPort, pk);
         if (fShutdown)
         {
@@ -564,13 +567,29 @@ void ThreadBtfAccept(void* parg)
         }
         if (rv == btf::RV_INVALID)
         {
+            LogPrint("net", "rendezvous: could not register at %s, trying another\n",
+                     strMeeting.c_str());
             iRelay++;       // this relay is down/attacked -> try the next one
             Sleep(3000);
             continue;
         }
-        // Registered OK: advertise THIS relay in our descriptor so clients dial
-        // us here, and keep using it (iRelay unchanged) until it fails.
+
+        // Registered. Advertise THIS relay now, while we are listed and before
+        // anybody dials -- a descriptor naming it is what makes a dial possible
+        // at all. Keep using it (iRelay unchanged) until it fails.
         BtfSetActiveRelay(strMeeting);
+        LogPrint("net", "rendezvous: registered at %s, waiting for a dial\n",
+                 strMeeting.c_str());
+
+        // Now block for someone to arrive.
+        if (!btf::RvServiceWaitPaired(rv))
+        {
+            btf::RvClose(rv);
+            LogPrint("net", "rendezvous: %s dropped us before any dial, re-registering\n",
+                     strMeeting.c_str());
+            continue;
+        }
+
         btf_socket_t hSocket = btf::BtfServiceWrap(rv, sk);
         if (hSocket == INVALID_SOCKET)
             continue;

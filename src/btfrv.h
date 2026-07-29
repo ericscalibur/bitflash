@@ -37,10 +37,19 @@ bool RvRelayRun(unsigned short port);
 void RvRelayStop();
 
 // ---- service side (the node being reached by its .btf address) ----
-// Register at the relay under `my_pubkey` (32 bytes) and block until a client is
-// paired to us. Returns the paired socket, or RV_INVALID on error.
+// Register at the relay under `my_pubkey` (32 bytes). Returns as soon as the
+// relay has us listed, WITHOUT waiting for anyone to dial -- the caller needs
+// that moment to start advertising this relay as its meeting node. Waiting for
+// the dial was folded into this call before, which deadlocked discovery: a node
+// could not be advertised until it had been dialled, and could not be dialled
+// until it was advertised. Returns RV_INVALID on error.
 RvSocket RvServiceRegister(const char* relay_host, unsigned short port,
                            const unsigned char my_pubkey[32]);
+
+// Block on a registered service socket until a client is paired to us. Returns
+// false if the relay drops us or errors, in which case the caller should close
+// the socket and register again.
+bool RvServiceWaitPaired(RvSocket s);
 
 // ---- client side (the node dialing a .btf address) ----
 // Connect through the relay to the service registered under `target_pubkey`.
