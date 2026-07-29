@@ -2,6 +2,13 @@
 // Distributed under the MIT/X11 software license, see the accompanying
 // file license.txt or http://www.opensource.org/licenses/mit-license.php.
 
+#pragma push_macro("snprintf")
+#undef snprintf
+#include <nlohmann/json.hpp>
+#pragma pop_macro("snprintf")
+#ifdef snprintf
+#undef snprintf
+#endif
 #include "headers.h"
 #ifdef _WIN32
 #include <winsock2.h>
@@ -10,6 +17,7 @@
 #include "btfaddr.h"
 #include "btftunnel.h"
 
+void ThreadReconnectCachedBtfPeers(void* parg);
 void ThreadMessageHandler2(void* parg);
 void ThreadSocketHandler2(void* parg);
 
@@ -259,6 +267,269 @@ static CAddress BtfMarkerAddr(const unsigned char b5[5])
 // ConnectNodeBtfResolved (which takes an already-resolved descriptor, so it
 // makes no Nostr relay calls at all -- see nostr.cpp's BtfResolveMany for why
 // that matters when dialing many candidates in parallel).
+//
+// Peers we have actually reached, remembered across restarts.
+//
+// Discovery is otherwise entirely dependent on the Nostr relays: a node that
+// has been running for hours and knows exactly which peers answer throws all
+// of it away on exit, and the next start walks the same ~96%-dead descriptor
+// list again. Reconnecting from this file skips the relays completely --
+// address, meeting node and encryption key are all we need.
+//
+static const size_t MAX_CACHED_BTF_PEERS = 50;
+static const int64  CACHED_BTF_PEER_TTL  = 7 * 24 * 60 * 60; // a week
+
+struct CachedBtfPeer
+{
+    string btfAddr;
+    string meeting;
+    string encHex;
+    int64  lastSeen;
+    // The peer's own signed descriptor, as it announced itself. Kept verbatim
+    // because that signature is what lets us hand this peer on to somebody
+    // else: the receiver checks it against the key the address decodes to and
+    // never has to take our word for anything. Empty for entries learned
+    // before peer exchange existed, or resolved through Nostr -- those are
+    // still dialable, just not relayable.
+    string desc;
+};
+
+static string BtfPeerCachePath() { return GetAppDir() + "/btfpeers.json"; }
+
+static string BytesToHex(const unsigned char* p, size_t n)
+{
+    static const char* h = "0123456789abcdef";
+    string s;
+    s.reserve(n * 2);
+    for (size_t i = 0; i < n; i++) { s += h[p[i] >> 4]; s += h[p[i] & 0xf]; }
+    return s;
+}
+
+static bool HexToBytes(const string& s, unsigned char* out, size_t n)
+{
+    if (s.size() != n * 2) return false;
+    for (size_t i = 0; i < n; i++)
+    {
+        unsigned int b;
+        if (sscanf(s.c_str() + i * 2, "%2x", &b) != 1) return false;
+        out[i] = (unsigned char)b;
+    }
+    return true;
+}
+
+void LoadCachedBtfPeers(vector<CachedBtfPeer>& out)
+{
+    out.clear();
+    FILE* f = fopen(BtfPeerCachePath().c_str(), "r");
+    if (!f) return;
+    string body;
+    char buf[4096];
+    size_t r;
+    while ((r = fread(buf, 1, sizeof(buf), f)) > 0) body.append(buf, r);
+    fclose(f);
+    try
+    {
+        nlohmann::json arr = nlohmann::json::parse(body);
+        if (!arr.is_array()) return;
+        int64 nNow = GetTime();
+        for (const auto& o : arr)
+        {
+            if (!o.is_object()) continue;
+            if (!o.contains("btf") || !o["btf"].is_string()) continue;
+            if (!o.contains("meeting") || !o["meeting"].is_string()) continue;
+            if (!o.contains("enc") || !o["enc"].is_string()) continue;
+            CachedBtfPeer p;
+            p.btfAddr  = o["btf"].get<string>();
+            p.meeting  = o["meeting"].get<string>();
+            p.encHex   = o["enc"].get<string>();
+            p.lastSeen = o.value("seen", (int64)0);
+            if (o.contains("desc") && o["desc"].is_string())
+                p.desc = o["desc"].get<string>();
+            if (nNow - p.lastSeen > CACHED_BTF_PEER_TTL) continue; // long gone
+            out.push_back(p);
+        }
+    }
+    catch (...)
+    {
+        LogPrint("net", "btfpeers: cache unreadable, starting empty\n");
+        out.clear();
+    }
+}
+
+static CCriticalSection cs_btfPeerCache;
+
+// strDesc is the peer's own signed descriptor when we have it (it announced
+// itself over peer exchange), "" when we only resolved it through Nostr. An
+// empty one never clears a descriptor already on file: dialing a peer we first
+// learned about by exchange must not cost us the ability to pass it on.
+static void RememberBtfPeer(const string& strBtfAddr, const string& strMeeting,
+                            const unsigned char enc_pub[32],
+                            const string& strDesc = string())
+{
+    CRITICAL_BLOCK(cs_btfPeerCache)
+    {
+        vector<CachedBtfPeer> peers;
+        LoadCachedBtfPeers(peers);
+
+        string strKeepDesc = strDesc;
+        for (size_t i = 0; i < peers.size(); i++)
+            if (peers[i].btfAddr == strBtfAddr)
+            {
+                if (strKeepDesc.empty())
+                    strKeepDesc = peers[i].desc;
+                peers.erase(peers.begin() + i);
+                break;
+            }
+
+        CachedBtfPeer p;
+        p.btfAddr  = strBtfAddr;
+        p.meeting  = strMeeting;
+        p.encHex   = BytesToHex(enc_pub, 32);
+        p.lastSeen = GetTime();
+        p.desc     = strKeepDesc;
+        peers.insert(peers.begin(), p); // most recent first
+
+        if (peers.size() > MAX_CACHED_BTF_PEERS)
+            peers.resize(MAX_CACHED_BTF_PEERS);
+
+        nlohmann::json arr = nlohmann::json::array();
+        foreach(const CachedBtfPeer& q, peers)
+        {
+            nlohmann::json o;
+            o["btf"]     = q.btfAddr;
+            o["meeting"] = q.meeting;
+            o["enc"]     = q.encHex;
+            o["seen"]    = q.lastSeen;
+            if (!q.desc.empty())
+                o["desc"] = q.desc;
+            arr.push_back(o);
+        }
+        FILE* f = fopen(BtfPeerCachePath().c_str(), "w");
+        if (f)
+        {
+            string s = arr.dump(2);
+            fwrite(s.c_str(), 1, s.size(), f);
+            fclose(f);
+        }
+    }
+}
+
+// Dial everything we reached last time, before the relays have said anything.
+void ThreadReconnectCachedBtfPeers(void* parg)
+{
+    vector<CachedBtfPeer> peers;
+    LoadCachedBtfPeers(peers);
+    if (peers.empty())
+    {
+        LogPrint("net", "btfpeers: no cache yet, waiting on relay discovery\n");
+        return;
+    }
+    LogPrint("net", "btfpeers: trying %zu remembered peer(s) before discovery\n",
+             peers.size());
+
+    int nConnected = 0;
+    foreach(const CachedBtfPeer& p, peers)
+    {
+        if (fShutdown) return;
+        unsigned char enc[32];
+        if (!HexToBytes(p.encHex, enc, 32)) continue;
+        if (ConnectNodeBtfResolved(p.btfAddr, p.meeting, enc))
+        {
+            nConnected++;
+            if (nConnected >= 8) break; // enough to bootstrap; the rest can wait
+        }
+    }
+    LogPrint("net", "btfpeers: %d of %zu remembered peer(s) answered\n",
+             nConnected, peers.size());
+}
+
+//
+// .btf peer exchange
+//
+// Until now discovery depended entirely on the Nostr relays: two connected
+// nodes never told each other who else existed, so a relay outage left a
+// running network unable to grow, and a node that found one stale peer had no
+// way to learn there was anything better.
+//
+// What travels here is each peer's own signed descriptor. The receiver checks
+// the Schnorr signature against the key the `.btf` address decodes to, so the
+// sender is trusted for nothing -- forging an entry would need somebody else's
+// secret key. That leaves flooding: valid descriptors for keys the sender
+// generated itself. The caps below bound one message, and the cache prefers
+// peers that actually answered, so a flood costs a Sybil more than it costs us.
+//
+
+void BtfPexCollect(vector<string>& vDescOut)
+{
+    vDescOut.clear();
+
+    // Ours first -- the node on the other end may know nobody but us.
+    string strMine = BtfLocalDescriptor();
+    if (!strMine.empty())
+        vDescOut.push_back(strMine);
+
+    vector<CachedBtfPeer> peers;
+    CRITICAL_BLOCK(cs_btfPeerCache)
+        LoadCachedBtfPeers(peers);
+
+    // Most recently seen first: these answered us, they are not names copied
+    // off a relay listing.
+    foreach(const CachedBtfPeer& p, peers)
+    {
+        if (vDescOut.size() >= MAX_PEX_DESCRIPTORS) break;
+        if (p.desc.empty()) continue;                          // nothing provable to pass on
+        if (p.desc.size() > MAX_PEX_DESCRIPTOR_BYTES) continue;
+        vDescOut.push_back(p.desc);
+    }
+}
+
+int BtfPexAccept(const vector<string>& vDesc)
+{
+    void* ctx = BtfSecpContext();
+    if (!ctx)
+        return 0;
+
+    string strSelf = BtfLocalAddress();
+    int nKept = 0;
+    unsigned int nSeen = 0;
+
+    foreach(const string& strDesc, vDesc)
+    {
+        if (++nSeen > MAX_PEX_DESCRIPTORS) break;
+        if (strDesc.empty() || strDesc.size() > MAX_PEX_DESCRIPTOR_BYTES) continue;
+
+        // The descriptor names the key it belongs to, and taking that key from
+        // the blob is safe precisely because the signature must verify under
+        // it: nobody can produce a valid descriptor for a key they don't hold.
+        unsigned char pubkey[32];
+        try
+        {
+            nlohmann::json v = nlohmann::json::parse(strDesc);
+            if (!v.is_object() || !v.contains("pubkey") || !v["pubkey"].is_string())
+                continue;
+            if (!HexToBytes(v["pubkey"].get<string>(), pubkey, 32))
+                continue;
+        }
+        catch (...) { continue; }   // malformed JSON from an untrusted peer
+
+        btf::Descriptor d;
+        if (!btf::VerifyDescriptor(ctx, strDesc, pubkey, d))
+            continue;
+
+        string strAddr = btf::Address(pubkey);
+        if (strAddr.empty() || strAddr == strSelf)
+            continue;               // ourselves, nothing to learn
+
+        unsigned char enc[32];
+        if (!HexToBytes(d.enc, enc, 32))
+            continue;
+
+        RememberBtfPeer(strAddr, d.meeting_node, enc, strDesc);
+        nKept++;
+    }
+    return nKept;
+}
+
 static CNode* ConnectNodeBtfTail(const string& strBtfAddr, const unsigned char pk[32],
                                   const string& strMeeting, const unsigned char enc_pub[32])
 {
@@ -288,6 +559,9 @@ static CNode* ConnectNodeBtfTail(const string& strBtfAddr, const unsigned char p
 
     if (fDebug)
         LogPrint("net", "connected %s via rendezvous %s\n", strBtfAddr.c_str(), strMeeting.c_str());
+
+    // This one answered -- worth trying first next time we start.
+    RememberBtfPeer(strBtfAddr, strMeeting, enc_pub);
 
     // Add node
     pnode = new CNode(hSocket, addr, false);
@@ -950,6 +1224,12 @@ bool StartNode(string& strError)
             printf("External IP updated: %s\n", addrLocalHost.ToStringIP().c_str());
         }
     }, 0, NULL);
+
+    // Peers that answered last time, dialled straight away. The relays are the
+    // only way to find anyone otherwise, and reaching them plus walking their
+    // descriptor list is what makes a restart take minutes.
+    if (_beginthread(ThreadReconnectCachedBtfPeers, 0, NULL) == -1)
+        printf("Error: _beginthread(ThreadReconnectCachedBtfPeers) failed\n");
 
     // Peer discovery over Nostr relays (replaces the old IRC seed)
     if (_beginthread(ThreadNostrSeed, 0, NULL) == -1)
