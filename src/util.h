@@ -269,29 +269,45 @@ string GetAppDir();
 inline int OutputDebugStringF(const char* pszFormat, ...)
 {
 #if 1 // debug.log always enabled
-    // Write to data directory so it's always findable
-    static string strDebugFile;
-    if (strDebugFile.empty()) {
-        string dir = GetAppDir();
-        if (!dir.empty())
-            strDebugFile = dir + 
-#ifdef _WIN32
-                "\\"
-#else
-                "/"
-#endif
-                + "debug.log";
-        else
-            strDebugFile = "debug.log";
-    }
-    FILE* fileout = fopen(strDebugFile.c_str(), "a");
-    if (fileout)
+    // Write to data directory so it's always findable.
+    //
+    // Path resolution and the write are both under the lock, because neither
+    // used to be under anything. strDebugFile was filled in lazily inside an
+    // `if (empty())`, so one thread could read the path while another was
+    // still assigning to it -- and at startup three threads log within
+    // milliseconds of each other. When that raced, fopen got a torn path,
+    // returned NULL, and the `if (fileout)` below dropped the line silently.
+    // Measured before this change: unconditional first-statement printfs in
+    // ThreadBtfAccept, ThreadNostrSeed and the cached-peer thread reached the
+    // file in only 4/6, 5/6 and 2/6 of runs respectively. Concluding a thread
+    // never ran because its line was absent was not sound, and the lock also
+    // stops several threads calling fopen on the same file at once.
+    static CCriticalSection cs_debugFile;
+    CRITICAL_BLOCK(cs_debugFile)
     {
-        va_list arg_ptr;
-        va_start(arg_ptr, pszFormat);
-        vfprintf(fileout, pszFormat, arg_ptr);
-        va_end(arg_ptr);
-        fclose(fileout);
+        static string strDebugFile;
+        if (strDebugFile.empty()) {
+            string dir = GetAppDir();
+            if (!dir.empty())
+                strDebugFile = dir +
+#ifdef _WIN32
+                    "\\"
+#else
+                    "/"
+#endif
+                    + "debug.log";
+            else
+                strDebugFile = "debug.log";
+        }
+        FILE* fileout = fopen(strDebugFile.c_str(), "a");
+        if (fileout)
+        {
+            va_list arg_ptr;
+            va_start(arg_ptr, pszFormat);
+            vfprintf(fileout, pszFormat, arg_ptr);
+            va_end(arg_ptr);
+            fclose(fileout);
+        }
     }
 
 #ifndef _WIN32
