@@ -71,5 +71,35 @@ bitflash: $(IMGUI_OBJS) $(NODE_OBJS) $(GUI_OBJS)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LIBS)
 	@echo "Built: bitflash"
 
+# ---- headless node ---------------------------------------------------------
+#
+# Same node, built without ImGui, GLFW or OpenGL. Linking the GUI made the
+# binary require libGL at load time even when started with -nogui, because the
+# dynamic loader resolves everything before main() runs -- so on a clean server,
+# which is where a node most naturally lives, it failed to start with an error
+# about shared libraries and no hint that it would otherwise work.
+#
+# Objects go to obj-node/ because main_gui.cpp is compiled twice, with and
+# without -DBITFLASH_NO_GUI, and the two must not overwrite each other.
+
+NODE_LIBS = -L$(SECP_LIB) -lsecp256k1 \
+            -L$(RANDOMX_DIR)/build -lrandomx \
+            -lsodium -lssl -lcrypto -ldb_cxx -lpthread
+
+NODE_ONLY_OBJS = $(patsubst obj/%,obj-node/%,$(NODE_OBJS)) \
+                 obj-node/main_gui.o obj-node/headless.o
+
+obj-node/%.o: %.cpp $(HEADERS)
+	@mkdir -p obj-node
+	$(CXX) -c $(CXXFLAGS) -DBITFLASH_NO_GUI -o $@ $<
+
+obj-node/sha.o: sha.cpp sha.h
+	@mkdir -p obj-node
+	$(CXX) -c $(CXXFLAGS) -DBITFLASH_NO_GUI -O3 -o $@ $<
+
+bitflash-node: $(NODE_ONLY_OBJS)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(NODE_LIBS)
+	@echo "Built: bitflash-node (headless, no libGL needed)"
+
 clean:
-	rm -rf obj bitflash
+	rm -rf obj obj-node bitflash bitflash-node

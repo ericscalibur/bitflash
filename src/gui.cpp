@@ -171,14 +171,8 @@ static void RefreshWallet()
 
 void MainFrameRepaint() { g_needRefresh = true; }
 
-string DateTimeStr(int64 nTime)
-{
-    time_t t = (time_t)nTime;
-    struct tm* p = localtime(&t);
-    if (!p) return "";
-    char buf[32]; strftime(buf, sizeof(buf), "%m/%d/%y %H:%M", p);
-    return buf;
-}
+// DateTimeStr moved to util.cpp: main.cpp logs block times with it, so it is
+// needed by builds that have no GUI at all.
 
 // ---------------------------------------------------------------------------
 // Status bar -- separate fullscreen-width overlay pinned to bottom edge.

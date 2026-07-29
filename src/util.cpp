@@ -490,3 +490,15 @@ void AddTimeData(unsigned int ip, int64 nTime)
         printf("|  nTimeOffset = %+lld  (%+lld minutes)\n", nTimeOffset, nTimeOffset/60);
     }
 }
+
+// Formats a block or transaction timestamp for logs and for the wallet view.
+// It lived in gui.cpp, but main.cpp logs block times with it, so a headless
+// build needed it too -- and nothing about formatting a date is GUI work.
+string DateTimeStr(int64 nTime)
+{
+    time_t t = (time_t)nTime;
+    struct tm* p = localtime(&t);
+    if (!p) return "";
+    char buf[32]; strftime(buf, sizeof(buf), "%m/%d/%y %H:%M", p);
+    return buf;
+}

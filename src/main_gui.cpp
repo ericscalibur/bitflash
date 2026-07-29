@@ -5,7 +5,11 @@
 #include <csignal>
 #endif
 
+// BITFLASH_NO_GUI builds the same entry point without ImGui, GLFW or OpenGL,
+// so the binary does not need libGL present just to start. See headless.cpp.
+#ifndef BITFLASH_NO_GUI
 int RunGUI(int argc, char* argv[]);
+#endif
 
 // Global definitions (were in ui.cpp, now here)
 map<string,string> mapAddressBook;
@@ -186,8 +190,13 @@ int main(int argc, char* argv[])
         if (_beginthread(ThreadBitcoinMiner, 0, NULL) == (uintptr_t)-1)
             printf("Error: _beginthread(ThreadBitcoinMiner) failed\n");
 
+#ifdef BITFLASH_NO_GUI
+    // Nothing else this binary can do; /nogui is accepted and redundant.
+    bool fHeadless = true;
+#else
     bool fHeadless = arg(argc,argv,"/nogui") || arg(argc,argv,"-nogui") ||
                      arg(argc,argv,"/daemon") || arg(argc,argv,"-daemon");
+#endif
 
     if (fHeadless) {
 #ifndef _WIN32
@@ -200,8 +209,12 @@ int main(int argc, char* argv[])
         return 0;
     }
 
+#ifdef BITFLASH_NO_GUI
+    return 0;   // unreachable: fHeadless is always true in this build
+#else
     int ret = RunGUI(argc, argv);
     fShutdown = true;
     StopNode();
     return ret;
+#endif
 }

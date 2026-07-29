@@ -15,6 +15,18 @@ linux: deps-linux
 	$(MAKE) -C src -f Makefile -j$(NPROC)
 	strip src/bitflash
 	$(MAKE) -f Makefile appimage
+	$(MAKE) -f Makefile linux-node
+
+# Headless node, no ImGui/GLFW/OpenGL. The GUI build needs libGL present at load
+# time even when started with -nogui -- the dynamic loader resolves everything
+# before main() runs, so the flag comes far too late. On a clean server, which is
+# where a node most naturally lives, that is a hard failure. This binary has no
+# such dependency and needs no FUSE either, so it drops onto a VPS and runs.
+linux-node: deps-linux
+	$(MAKE) -C src -f Makefile bitflash-node -j$(NPROC)
+	strip src/bitflash-node
+	cp src/bitflash-node bitflash-node-$(VERSION)-x86_64
+	@echo "Built: bitflash-node-$(VERSION)-x86_64"
 
 deps-linux: deps-apt deps-secp256k1 deps-randomx
 
