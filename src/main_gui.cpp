@@ -168,6 +168,56 @@ static void ParseStartupArguments(int argc, char* argv[])
     }
 }
 
+
+// Headless status line.
+//
+// GetBalance() had exactly one caller, the ImGui GUI, so a headless node could
+// mine indefinitely with no way to report what it had earned. The found-block
+// message in BitcoinMiner() sits behind the "net" log category, which is off
+// unless /debug is passed, so a solo miner that found a block printed nothing
+// whatsoever.
+//
+// Mined coins are coinbase outputs and CWalletTx::GetCredit() deliberately
+// values immature coinbase at 0, so mature and immature are reported apart
+// rather than summed into one misleading number.
+static void PrintStatusLine()
+{
+    int64 nMature   = GetBalance();
+    int64 nImmature = 0;
+    int nMinedTotal = 0, nMinedImmature = 0;
+    CRITICAL_BLOCK(cs_mapWallet)
+    {
+        for (map<uint256, CWalletTx>::iterator it = mapWallet.begin();
+             it != mapWallet.end(); ++it)
+        {
+            CWalletTx* pcoin = &(*it).second;
+            if (!pcoin->IsCoinBase())
+                continue;
+            nMinedTotal++;
+            if (pcoin->GetBlocksToMaturity() > 0)
+            {
+                nMinedImmature++;
+                nImmature += pcoin->CTransaction::GetCredit();
+            }
+        }
+    }
+    int nPeers = 0;
+    CRITICAL_BLOCK(cs_vNodes)
+        nPeers = (int)vNodes.size();
+
+    printf("STATUS height=%d peers=%d blocks_mined=%d spendable=%s maturing=%s (%d block(s))\n",
+           nBestHeight, nPeers, nMinedTotal,
+           FormatMoney(nMature).c_str(),
+           FormatMoney(nImmature).c_str(), nMinedImmature);
+    // Only the GUI ever displayed this, so a headless operator had no way to
+    // learn the address other nodes must dial to reach them -- which makes
+    // deliberate peering with a known node impossible.
+    printf("STATUS btf=%s\n", BtfLocalAddress().c_str());
+    if (fGenerateBitcoins)
+        printf("STATUS hashrate=%.0f H/s\n", HashMeterRate());
+    fflush(stdout);
+}
+
 int main(int argc, char* argv[])
 {
     if (arg(argc,argv,"/help") || arg(argc,argv,"-help") ||
@@ -274,7 +324,20 @@ int main(int argc, char* argv[])
         signal(SIGINT,sig); signal(SIGTERM,sig);
 #endif
         printf("Running headless. Ctrl-C to stop.\n");
-        while (!fShutdown) Sleep(500);
+        // Status every 60s (BITFLASH_STATUS_SECS=0 disables).
+        int nStatusSecs = 60;
+        const char* pszStatus = getenv("BITFLASH_STATUS_SECS");
+        if (pszStatus) nStatusSecs = atoi(pszStatus);
+        int64 nLastStatus = 0;
+        while (!fShutdown)
+        {
+            Sleep(500);
+            if (nStatusSecs > 0 && GetTime() - nLastStatus >= nStatusSecs)
+            {
+                nLastStatus = GetTime();
+                PrintStatusLine();
+            }
+        }
         StopNode();
         return 0;
     }
