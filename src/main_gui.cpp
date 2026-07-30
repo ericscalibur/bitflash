@@ -59,7 +59,7 @@ static void PrintUsage()
     printf("  /pooldashboard=URL  (alias: /pooldash=URL)\n");
     printf("\n");
     printf(".btf and rendezvous:\n");
-    printf("  /connectbtf=PEER_BTF_ADDRESS\n");
+    printf("  /connectbtf=PEER_BTF_ADDRESS  (repeatable)\n");
     printf("  /rvrelay=HOST:PORT\n");
     printf("  /announcerelay=HOST:PORT\n");
     printf("\n");
@@ -107,9 +107,20 @@ static void ParseStartupArguments(int argc, char* argv[])
     if (!poolFee.empty())
         dPoolFeePercent = atof(poolFee.c_str());
 
-    string btfConnect = argval2(argc, argv, "/connectbtf", "-connectbtf");
-    if (!btfConnect.empty())
-        strBtfConnect = btfConnect;
+    // /connectbtf=ADDRESS, repeatable -- scan every argument rather than using
+    // argval2(), which returns only the first match. /btfseed below already
+    // works this way; this did not, so a second /connectbtf was discarded.
+    for (int i = 1; i < argc; i++)
+    {
+        string s = argv[i];
+        size_t eq = s.find('=');
+        if (eq == string::npos) continue;
+        string key = s.substr(0, eq);
+        if (key != "/connectbtf" && key != "-connectbtf") continue;
+        string val = s.substr(eq + 1);
+        if (!val.empty())
+            vBtfConnect.push_back(val);
+    }
 
     string rvRelay = argval2(argc, argv, "/rvrelay", "-rvrelay");
     if (!rvRelay.empty())

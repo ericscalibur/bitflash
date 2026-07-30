@@ -43,7 +43,11 @@ map<CInv, CDataStream> mapRelay;
 deque<pair<int64, CInv> > vRelayExpiration;
 CCriticalSection cs_mapRelay;
 map<CInv, int64> mapAlreadyAskedFor;
-string strBtfConnect; // .btf peer to keep connected to (from /connectbtf)
+// .btf peers to keep connected to (from /connectbtf, one entry per flag).
+// This was a single string, so a second /connectbtf was silently ignored --
+// argval() returns the first match and stops. With three or more nodes
+// deliberately peering, each could only ever pin one of the others.
+vector<string> vBtfConnect;
 
 
 bool GetMyExternalIP(unsigned int& ipRet)
@@ -1351,10 +1355,13 @@ bool StartNode(string& strError)
         if (_beginthread(ThreadBtfAccept, 0, NULL) == -1)
             printf("Error: _beginthread(ThreadBtfAccept) failed\n");
 
-    // Anonymous outbound: keep a connection to a specific .btf peer, if asked.
-    if (!strBtfConnect.empty())
-        if (_beginthread(ThreadBtfConnect, 0, new string(strBtfConnect)) == -1)
-            printf("Error: _beginthread(ThreadBtfConnect) failed\n");
+    // Anonymous outbound: keep a connection to each specific .btf peer asked
+    // for. One thread per peer, each reconnecting its own address on the 30s
+    // cycle ThreadBtfConnect already implemented for a single peer.
+    for (unsigned int i = 0; i < vBtfConnect.size(); i++)
+        if (_beginthread(ThreadBtfConnect, 0, new string(vBtfConnect[i])) == -1)
+            printf("Error: _beginthread(ThreadBtfConnect) failed for %s\n",
+                   vBtfConnect[i].c_str());
 
     //
     // Start threads
