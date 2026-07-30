@@ -1,6 +1,7 @@
 // Bitflash entry point -- starts node threads then runs GUI (or headless).
 
 #include "headers_core.h"
+#include <thread>
 #ifndef _WIN32
 #include <csignal>
 #endif
@@ -222,8 +223,34 @@ int main(int argc, char* argv[])
             printf("Error: _beginthread(ThreadRPCServer) failed\n");
     }
     if (fGenerateBitcoins)
-        if (_beginthread(ThreadBitcoinMiner, 0, NULL) == (uintptr_t)-1)
-            printf("Error: _beginthread(ThreadBitcoinMiner) failed\n");
+    {
+        // One miner thread per core -- the todo in net.cpp above
+        // ThreadBitcoinMiner. Override with BITFLASH_MINERS=N.
+        //
+        // Participant mode stays single-threaded on purpose: each thread would
+        // open its own pool connection and submit shares independently.
+        int nMiners = 1;
+        if (nMineMode == MINE_SOLO)
+        {
+            const char* pszMiners = getenv("BITFLASH_MINERS");
+            if (pszMiners && atoi(pszMiners) > 0)
+                nMiners = atoi(pszMiners);
+            else
+            {
+                unsigned int n = std::thread::hardware_concurrency();
+                nMiners = n > 0 ? (int)n : 1;
+            }
+            // Build the ~2 GB dataset once, before any miner thread exists.
+            // RandomXInitDataset() is not thread-safe and guards only on the
+            // g_fFast flag it sets at the end, so N threads reaching it together
+            // would each allocate their own 2 GB dataset.
+            RandomXInitDataset(nMiners);
+        }
+        printf("Starting %d miner thread(s)\n", nMiners);
+        for (int i = 0; i < nMiners; i++)
+            if (_beginthread(ThreadBitcoinMiner, 0, NULL) == (uintptr_t)-1)
+                printf("Error: _beginthread(ThreadBitcoinMiner) failed\n");
+    }
 
 #ifdef BITFLASH_NO_GUI
     // Nothing else this binary can do; /nogui is accepted and redundant.
