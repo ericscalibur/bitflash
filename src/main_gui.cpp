@@ -202,7 +202,7 @@ static void PrintStatusLine()
 {
     int64 nMature   = GetBalance();
     int64 nImmature = 0;
-    int nMinedTotal = 0, nMinedImmature = 0;
+    int nMinedTotal = 0, nMinedImmature = 0, nMinedOrphaned = 0;
     CRITICAL_BLOCK(cs_mapWallet)
     {
         for (map<uint256, CWalletTx>::iterator it = mapWallet.begin();
@@ -212,7 +212,19 @@ static void PrintStatusLine()
             if (!pcoin->IsCoinBase())
                 continue;
             nMinedTotal++;
-            if (pcoin->GetBlocksToMaturity() > 0)
+            // An orphaned block has depth 0, so GetBlocksToMaturity() reports
+            // the full maturity and the coins masquerade as "maturing" forever.
+            // Ask whether the block is on the main chain, not how deep it is.
+            bool fOrphan = false;
+            if (pcoin->hashBlock != 0 && pcoin->nIndex != -1)
+            {
+                map<uint256, CBlockIndex*>::iterator mb = mapBlockIndex.find(pcoin->hashBlock);
+                if (mb != mapBlockIndex.end() && (*mb).second)
+                    fOrphan = !(*mb).second->IsInMainChain();
+            }
+            if (fOrphan)
+                nMinedOrphaned++;
+            else if (pcoin->GetBlocksToMaturity() > 0)
             {
                 nMinedImmature++;
                 nImmature += pcoin->CTransaction::GetCredit();
@@ -223,8 +235,10 @@ static void PrintStatusLine()
     CRITICAL_BLOCK(cs_vNodes)
         nPeers = (int)vNodes.size();
 
-    printf("STATUS height=%d peers=%d blocks_mined=%d spendable=%s maturing=%s (%d block(s))\n",
+    printf("STATUS height=%d peers=%d blocks_mined=%d accepted=%d orphaned=%d "
+           "spendable=%s maturing=%s (%d block(s))\n",
            nBestHeight, nPeers, nMinedTotal,
+           nMinedTotal - nMinedOrphaned, nMinedOrphaned,
            FormatMoney(nMature).c_str(),
            FormatMoney(nImmature).c_str(), nMinedImmature);
     // Only the GUI ever displayed this, so a headless operator had no way to
