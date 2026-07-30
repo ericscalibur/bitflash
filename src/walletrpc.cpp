@@ -509,10 +509,24 @@ static void Respond(SOCKET s, int code, const char* status,
     SendRaw(s, string(hdr) + body);
 }
 
+static const char* ReasonPhrase(int code)
+{
+    switch (code)
+    {
+    case 200: return "OK";
+    case 204: return "No Content";
+    case 400: return "Bad Request";
+    case 401: return "Unauthorized";
+    case 403: return "Forbidden";
+    case 404: return "Not Found";
+    case 405: return "Method Not Allowed";
+    default:  return "Error";
+    }
+}
+
 static void RespondJson(SOCKET s, int code, const json& j)
 {
-    Respond(s, code, code == 200 ? "OK" : "Bad Request",
-            j.dump(), "application/json");
+    Respond(s, code, ReasonPhrase(code), j.dump(), "application/json");
 }
 
 static string HeaderValue(const string& req, const char* name)
@@ -583,6 +597,15 @@ static void HandleConnection(SOCKET s)
         return;
     }
 
+    // Browsers request this unprompted on every page load; 404ing it put a red
+    // line in the console on each visit, which is indistinguishable from a real
+    // failure when you are trying to debug one.
+    if (method == "GET" && path == "/favicon.ico")
+    {
+        Respond(s, 204, ReasonPhrase(204), "", "image/x-icon");
+        return;
+    }
+
     if (path.substr(0, 5) != "/api/")
     {
         json j; j["error"] = "no such endpoint";
@@ -624,6 +647,23 @@ static void HandleConnection(SOCKET s)
     catch (...)               { out = json::object(); out["error"] = "internal error"; }
 
     RespondJson(s, out.contains("error") ? 400 : 200, out);
+}
+
+// One thread per connection.
+//
+// The accept loop used to call HandleConnection() inline, which made the whole
+// server strictly sequential -- and browsers open speculative preconnect
+// sockets that send no request at all. Such a socket parked the single handler
+// in recv() for the entire SO_RCVTIMEO, and every other request, including the
+// page's own polling, queued behind it in the backlog. It presented as the
+// server randomly taking ten seconds to answer.
+static void HandleConnectionThread(void* parg)
+{
+    SOCKET s = *(SOCKET*)parg;
+    delete (SOCKET*)parg;
+    try { HandleConnection(s); }
+    catch (...) { }
+    closesocket(s);
 }
 
 void ThreadWalletRPC(void*)
@@ -713,9 +753,12 @@ void ThreadWalletRPC(void*)
         setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&io, sizeof(io));
         setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&io, sizeof(io));
 
-        try { HandleConnection(s); }
-        catch (...) { }
-        closesocket(s);
+        if (_beginthread(HandleConnectionThread, 0, new SOCKET(s)) == (uintptr_t)-1)
+        {
+            // Could not spawn: drop this one rather than block the accept loop.
+            printf("walletrpc: _beginthread failed, dropping connection\n");
+            closesocket(s);
+        }
     }
 
     closesocket(hListen);
