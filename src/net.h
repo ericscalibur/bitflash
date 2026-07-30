@@ -28,7 +28,7 @@ CNode* ConnectNodeBtfResolved(const string& strBtfAddr, const string& strMeeting
                               const unsigned char enc_pub[32]);
 void ThreadBtfAccept(void* parg);
 void ThreadBtfConnect(void* parg);
-extern string strBtfConnect;
+extern vector<string> vBtfConnect;   // /connectbtf, repeatable
 // Bootstrap seeds added at runtime with /btfseed=ADDRESS:ENCHEX (repeatable).
 // The compiled-in list lives in net.cpp; these are appended to it.
 extern std::vector<std::pair<std::string, std::string> > vBtfExtraSeeds;
