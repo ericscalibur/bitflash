@@ -2769,6 +2769,55 @@ static bool PoolParticipantMiner()
     return true;
 }
 
+//
+// Hash meter.
+//
+// Nothing in the node counted a hash: the GUI could report whether mining was
+// enabled but not how fast, and no counter existed anywhere to derive a rate
+// from. Miner threads add to a shared total; readers get a rate over a moving
+// window.
+//
+// The window is in whole seconds because util.h offers only GetTime(). Over a
+// 15-second window that is a few percent of timing error, well below the
+// natural variance of a RandomX hashrate.
+//
+static CCriticalSection cs_hashmeter;
+static int64  nHashesDone     = 0;    // monotonic total across all miner threads
+static int64  nHashSampleAt   = 0;    // GetTime() at last recompute
+static int64  nHashSampleBase = 0;    // nHashesDone at last recompute
+static double dHashesPerSec   = 0.0;  // last computed rate
+
+void HashMeterAdd(int nHashes)
+{
+    CRITICAL_BLOCK(cs_hashmeter)
+        nHashesDone += nHashes;
+}
+
+double HashMeterRate()
+{
+    double dRet = 0.0;
+    CRITICAL_BLOCK(cs_hashmeter)
+    {
+        int64 nNow = GetTime();
+        if (nHashSampleAt == 0)
+        {
+            // First read: open the window, no rate to report yet.
+            nHashSampleAt   = nNow;
+            nHashSampleBase = nHashesDone;
+        }
+        else if (nNow - nHashSampleAt >= 15)
+        {
+            dHashesPerSec = (double)(nHashesDone - nHashSampleBase)
+                          / (double)(nNow - nHashSampleAt);
+            nHashSampleAt   = nNow;
+            nHashSampleBase = nHashesDone;
+        }
+        dRet = dHashesPerSec;
+    }
+    return dRet;
+}
+
+
 bool BitcoinMiner()
 {
     // Relay mode: never mines, just relays/syncs. (Shouldn't normally get here
@@ -2950,6 +2999,7 @@ bool BitcoinMiner()
             // ~256 hashes is already plenty of time)
             if ((++pblock->nNonce & 0xff) == 0)
             {
+                HashMeterAdd(256);   // one batch since the previous check
                 CheckForShutdown(3);
                 if (pblock->nNonce == 0)
                     break;
