@@ -89,6 +89,8 @@ td{padding:9px 0;border-top:1px solid var(--line);font-size:13.5px;vertical-alig
 .pill{display:inline-block;font-size:11px;padding:2px 7px;border-radius:20px;
 background:#252a34;color:var(--mut)}
 .pill.m{background:#3a2f0c;color:var(--warn)}
+.pill.o{background:#3d1418;color:var(--err)}
+.bad{color:var(--err)}
 .msg{padding:11px 13px;border-radius:7px;margin-top:12px;font-size:13.5px;display:none}
 .msg.s{display:block;background:#0d2b14;border:1px solid var(--ok);color:#7ee495}
 .msg.e{display:block;background:#2d1113;border:1px solid var(--err);color:#ff9b95}
@@ -104,6 +106,7 @@ background:#252a34;color:var(--mut)}
     <div class="stat mut">Maturing<b class="mut" id="imm">–</b></div>
     <div class="stat mut">Blocks mined<b class="mut" id="mined">–</b></div>
     <div class="stat mut">Hashrate<b class="mut" id="hr">–</b></div>
+    <div class="stat mut">Orphaned<b class="mut" id="orph">–</b></div>
     <div class="stat mut">Height<b class="mut" id="h">–</b></div>
     <div class="stat mut">Peers<b class="mut" id="p">–</b></div>
   </div>
@@ -158,6 +161,9 @@ async function refresh(){
     document.getElementById("imm").textContent=f(i.maturing)+" BTF";
     document.getElementById("mined").textContent=i.blocks_mined;
     document.getElementById("hr").textContent=i.mining?hr(i.hashrate):"off";
+    const oe=document.getElementById("orph");
+    oe.textContent=i.blocks_orphaned+(i.blocks_orphaned?" ("+f(i.orphaned)+")":"");
+    oe.className=i.blocks_orphaned>0?"bad":"mut";
     document.getElementById("h").textContent=i.height;
     document.getElementById("p").textContent=i.peers;
     document.getElementById("sub").textContent=
@@ -167,9 +173,11 @@ async function refresh(){
     const tb=document.getElementById("tb");
     if(!t.txs.length){tb.innerHTML='<tr><td colspan="4" class="mut">Nothing yet.</td></tr>';return}
     tb.innerHTML=t.txs.map(x=>{
-      const pos=x.amount>=0;
+      const pos=x.amount>=0 && !x.orphaned;
       const pill=x.type==="mined"
-        ? '<span class="pill'+(x.maturing?' m':'')+'">'+(x.maturing?"maturing":"mined")+'</span>'
+        ? (x.orphaned
+            ? '<span class="pill o">orphaned</span>'
+            : '<span class="pill'+(x.maturing?' m':'')+'">'+(x.maturing?"maturing":"mined")+'</span>')
         : '<span class="pill">'+x.type+'</span>';
       return '<tr><td>'+pill+'</td><td class="mono">'+x.txid.slice(0,20)+'…<br>'
         +'<span class="mut" style="font-size:11.5px">'+x.confirmations+' conf</span></td>'
@@ -238,13 +246,41 @@ static void MakeToken()
     }
 }
 
-// Wallet snapshot. Mature and immature are reported apart because
-// CWalletTx::GetCredit() deliberately values immature coinbase at 0.
-static void WalletTotals(int64& nMature, int64& nImmature,
-                         int& nMined, int& nMinedImmature)
+// Is this wallet transaction's block on the main chain?
+//   1 = yes,  0 = block is known but NOT on the main chain (orphaned/stale),
+//  -1 = no block recorded yet, so we cannot tell.
+//
+// mapBlockIndex is read without holding cs_main, matching what
+// CMerkleTx::GetDepthInMainChain() beside it already does. Locking in one of
+// the two and not the other would introduce an inconsistent order rather than
+// remove a race.
+static int WalletTxChainStatus(const CWalletTx* p)
+{
+    if (p->hashBlock == 0 || p->nIndex == -1)
+        return -1;
+    map<uint256, CBlockIndex*>::const_iterator mi = mapBlockIndex.find(p->hashBlock);
+    if (mi == mapBlockIndex.end() || !(*mi).second)
+        return -1;
+    return (*mi).second->IsInMainChain() ? 1 : 0;
+}
+
+// Wallet snapshot, splitting mined coins three ways.
+//
+// Mature and immature are reported apart because CWalletTx::GetCredit()
+// deliberately values immature coinbase at 0. Orphaned coinbase has to be
+// separated too, and that is easy to get wrong: an orphaned block has
+// GetDepthInMainChain() == 0, so GetBlocksToMaturity() returns the full
+// COINBASE_MATURITY and the coins look like they are merely "maturing" -- and
+// keep looking that way forever, because the depth never grows. Counting them
+// as pending income overstates the balance permanently. They are counted here
+// only if the block is genuinely absent from the main chain, which is a
+// different question from how deep it is.
+static void WalletTotals(int64& nMature, int64& nImmature, int64& nOrphaned,
+                         int& nMined, int& nMinedImmature, int& nMinedOrphaned)
 {
     nMature = GetBalance();
-    nImmature = 0; nMined = 0; nMinedImmature = 0;
+    nImmature = 0; nOrphaned = 0;
+    nMined = 0; nMinedImmature = 0; nMinedOrphaned = 0;
     CRITICAL_BLOCK(cs_mapWallet)
     {
         for (map<uint256, CWalletTx>::iterator it = mapWallet.begin();
@@ -254,7 +290,12 @@ static void WalletTotals(int64& nMature, int64& nImmature,
             if (!p->IsCoinBase())
                 continue;
             nMined++;
-            if (p->GetBlocksToMaturity() > 0)
+            if (WalletTxChainStatus(p) == 0)
+            {
+                nMinedOrphaned++;
+                nOrphaned += p->CTransaction::GetCredit();
+            }
+            else if (p->GetBlocksToMaturity() > 0)
             {
                 nMinedImmature++;
                 nImmature += p->CTransaction::GetCredit();
@@ -319,15 +360,18 @@ static bool ParseAmount(const string& strIn, int64& nRet)
 
 static json RpcGetInfo()
 {
-    int64 nMature, nImmature; int nMined, nMinedImm;
-    WalletTotals(nMature, nImmature, nMined, nMinedImm);
+    int64 nMature, nImmature, nOrphaned; int nMined, nMinedImm, nMinedOrph;
+    WalletTotals(nMature, nImmature, nOrphaned, nMined, nMinedImm, nMinedOrph);
     int nPeers = 0;
     CRITICAL_BLOCK(cs_vNodes)
         nPeers = (int)vNodes.size();
     json j;
     j["spendable"]    = FormatAmount(nMature);
     j["maturing"]     = FormatAmount(nImmature);
-    j["blocks_mined"] = nMined;
+    j["blocks_mined"]    = nMined;                 // every block we ever found
+    j["blocks_accepted"] = nMined - nMinedOrph;    // ...that the chain kept
+    j["blocks_orphaned"] = nMinedOrph;             // ...that it did not
+    j["orphaned"]        = FormatAmount(nOrphaned);
     j["maturing_blocks"] = nMinedImm;
     j["height"]       = nBestHeight;
     j["peers"]        = nPeers;
@@ -347,7 +391,7 @@ static json RpcGetNewAddress()
 
 static json RpcListTransactions()
 {
-    struct Row { unsigned int t; string txid, type; int64 amt; int conf; bool imm; };
+    struct Row { unsigned int t; string txid, type; int64 amt; int conf; bool imm, orph; };
     vector<Row> rows;
     CRITICAL_BLOCK(cs_mapWallet)
     {
@@ -359,7 +403,8 @@ static json RpcListTransactions()
             r.txid = p->GetHash().GetHex();
             r.t    = p->nTimeReceived;
             r.conf = p->GetDepthInMainChain();
-            r.imm  = p->IsCoinBase() && p->GetBlocksToMaturity() > 0;
+            r.orph = p->IsCoinBase() && WalletTxChainStatus(p) == 0;
+            r.imm  = p->IsCoinBase() && !r.orph && p->GetBlocksToMaturity() > 0;
             int64 nCredit = p->CTransaction::GetCredit();
             int64 nDebit  = p->GetDebit();
             if (p->IsCoinBase())      { r.type = "mined";    r.amt = nCredit; }
@@ -384,6 +429,7 @@ static json RpcListTransactions()
         o["confirmations"] = rows[i].conf;
         o["time"]          = (int64)rows[i].t;
         o["maturing"]      = rows[i].imm;
+        o["orphaned"]      = rows[i].orph;
         arr.push_back(o);
     }
     json j; j["txs"] = arr;
@@ -408,8 +454,8 @@ static json RpcSendToAddress(const json& in)
     if (!ParseAmount(strAmt, nValue) || nValue <= 0)
         { j["error"] = "That is not a valid amount. Up to 8 decimal places."; return j; }
 
-    int64 nMature, nImmature; int nMined, nMinedImm;
-    WalletTotals(nMature, nImmature, nMined, nMinedImm);
+    int64 nMature, nImmature, nOrphaned; int nMined, nMinedImm, nMinedOrph;
+    WalletTotals(nMature, nImmature, nOrphaned, nMined, nMinedImm, nMinedOrph);
     if (nValue > nMature)
     {
         // Worth distinguishing: "you have it but it is not mature yet" is a very
