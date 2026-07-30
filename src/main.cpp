@@ -10,6 +10,9 @@
 #undef snprintf
 #endif
 #include "headers.h"
+#ifndef _WIN32
+#include <dirent.h>
+#endif
 #include "sha.h"
 #include <atomic>
 #include <mutex>
@@ -2780,14 +2783,13 @@ static bool PoolParticipantMiner()
 //
 // Hash meter.
 //
-// Nothing in the node counted a hash: the GUI could report whether mining was
-// enabled but not how fast, and no counter existed anywhere to derive a rate
-// from. Miner threads add to a shared total; readers get a rate over a moving
-// window.
+// Nothing in the node ever counted a hash: the GUI could say whether mining was
+// on but not how fast, and there was no counter anywhere to derive a rate from.
+// Miner threads add to a shared total; readers get a rate over a moving window.
 //
 // The window is in whole seconds because util.h offers only GetTime(). Over a
 // 15-second window that is a few percent of timing error, well below the
-// natural variance of a RandomX hashrate.
+// natural variance of a RandomX hashrate, which is bursty by design.
 //
 static CCriticalSection cs_hashmeter;
 static int64  nHashesDone     = 0;    // monotonic total across all miner threads
@@ -2809,7 +2811,7 @@ double HashMeterRate()
         int64 nNow = GetTime();
         if (nHashSampleAt == 0)
         {
-            // First read: open the window, no rate to report yet.
+            // First read: start the window, no rate to report yet.
             nHashSampleAt   = nNow;
             nHashSampleBase = nHashesDone;
         }
@@ -2823,6 +2825,146 @@ double HashMeterRate()
         dRet = dHashesPerSec;
     }
     return dRet;
+}
+
+
+//
+// Stall detection ("deaf node").
+//
+// Measured on this network: of 1,605 orphaned blocks in one node's history, only
+// FIVE had a parent on the main chain -- i.e. were genuine propagation races. The
+// other 1,600 were private-branch blocks, produced by nodes that silently stopped
+// receiving while continuing to mine. Propagation latency is worth ~0.5% here;
+// going deaf is worth the rest.
+//
+// A deaf node looks perfectly healthy: peers connected, no errors, threads alive,
+// hashrate normal. The only outward sign is that its tip stops advancing. So watch
+// exactly that, and say so loudly, because every block mined in this state is born
+// orphaned.
+//
+// The threshold has to allow for a genuinely quiet network. At a 2-minute target,
+// the chance of no block for 20 minutes is about e^-10, so a 20-minute default
+// raises essentially no false alarms.
+static CCriticalSection cs_stall;
+static int   nStallHeight  = -1;    // last height we saw
+static int64 nStallSince   = 0;     // GetTime() when it last changed
+static bool  fStallFlagged = false; // have we already shouted about it
+int64        nStallWarnSecs = 1200; // /stallwarn=SECS, 0 disables
+
+// When a stall is first detected, record what every thread is waiting on. A wedge
+// is hard to catch live -- by the time anyone looks, the evidence is a restart away
+// -- so capture it at the moment of detection instead.
+// Count our own threads. Done in-process with opendir rather than via popen:
+// popen runs a shell, so "/proc/self" inside it resolves to the SHELL, which has
+// one thread -- the first version of this reported "1 threads" for a node running
+// ten, and made a readable wchan look unreadable for the same reason.
+static long CountOwnThreads()
+{
+#ifndef _WIN32
+    DIR* d = opendir("/proc/self/task");
+    if (!d)
+        return 0;
+    long n = 0;
+    while (readdir(d) != NULL)
+        n++;
+    closedir(d);
+    return n > 2 ? n - 2 : n;    // discard . and ..
+#else
+    return 0;
+#endif
+}
+
+static void DumpThreadWaits()
+{
+#ifndef _WIN32
+    // Thread count first, and unconditionally: it is always readable and it is
+    // what actually identified both wedges observed so far -- a healthy node runs
+    // ~10 threads, a wedged one accumulated 95 and then 218 as callers piled up
+    // behind a held lock. The wchan histogram below is more precise but depends on
+    // kernel support, so it must not be the only thing recorded.
+    printf("STALL: %ld threads running (healthy is roughly 10; hundreds means "
+           "callers are queued behind a held lock)\n", CountOwnThreads());
+
+    // Explicit pid, not /proc/self, because this runs inside a shell.
+    char cmd[320];
+    my_snprintf(cmd, sizeof(cmd),
+        "for t in /proc/%d/task/*; do cat $t/wchan 2>/dev/null; echo; done"
+        " | sort | uniq -c | sort -rn | head -8", (int)getpid());
+
+    printf("STALL: what each thread is waiting on (wchan histogram):\n");
+    FILE* p = popen(cmd, "r");
+    if (!p)
+        return;
+    char buf[256];
+    bool fAny = false;
+    while (fgets(buf, sizeof(buf), p))
+    {
+        const char* q = buf;
+        while (*q == ' ' || (*q >= '0' && *q <= '9')) q++;
+        if (*q == '\n' || *q == '\0')
+            continue;               // blank wchan == unreadable, not informative
+        printf("STALL:   %s", buf);
+        fAny = true;
+    }
+    pclose(p);
+    if (!fAny)
+        printf("STALL:   (wchan unreadable on this kernel -- rely on the thread "
+               "count above)\n");
+#endif
+}
+
+// Call periodically. Returns seconds stalled, or 0 if healthy.
+int64 StallWatchUpdate()
+{
+    int nPeers = 0;
+    TRY_CRITICAL_BLOCK(cs_vNodes)
+        nPeers = (int)vNodes.size();
+
+    int64 nSecs = 0;
+    CRITICAL_BLOCK(cs_stall)
+    {
+        int64 nNow = GetTime();
+        if (nBestHeight != nStallHeight)
+        {
+            nStallHeight  = nBestHeight;
+            nStallSince   = nNow;
+            fStallFlagged = false;
+        }
+        else if (nStallSince == 0)
+        {
+            nStallSince = nNow;
+        }
+
+        // No peers is a different condition -- disconnected, not deaf -- and the
+        // miner already has its own guard for it.
+        if (nPeers > 0 && nStallWarnSecs > 0 && nStallSince > 0)
+        {
+            nSecs = nNow - nStallSince;
+            if (nSecs >= nStallWarnSecs && !fStallFlagged)
+            {
+                fStallFlagged = true;
+                printf("STALL: tip has not advanced for %lld seconds while %d peers "
+                       "are connected. This node may have stopped receiving blocks; "
+                       "every block mined now is likely to be orphaned. Restarting "
+                       "the node clears it.\n", (long long)nSecs, nPeers);
+                DumpThreadWaits();
+            }
+            if (nSecs < nStallWarnSecs)
+                nSecs = 0;
+        }
+    }
+    return nSecs;
+}
+
+int64 StallSeconds()
+{
+    int64 nRet = 0;
+    TRY_CRITICAL_BLOCK(cs_stall)
+    {
+        if (fStallFlagged && nStallSince > 0)
+            nRet = GetTime() - nStallSince;
+    }
+    return nRet;
 }
 
 
@@ -3003,14 +3145,14 @@ bool BitcoinMiner()
                 break;
             }
 
-            // Check stop conditions every 32 hashes, not 256: between a new
-            // block arriving and this check noticing it, the thread is hashing
-            // a template whose parent is already stale, and any block it finds
-            // in that window is born orphaned. At a few hundred H/s per thread
-            // 256 hashes is most of a second of that, per thread.
+            // Check stop conditions periodically. Every 32 hashes, not 256:
+            // between a new block arriving and this check noticing it, the
+            // thread is hashing a template whose parent is already stale, and
+            // any block it finds in that window is born orphaned. At a few
+            // hundred H/s per thread, 256 hashes is most of a second of that.
             if ((++pblock->nNonce & 0x1f) == 0)
             {
-                HashMeterAdd(32);    // one batch since the previous check
+                HashMeterAdd(32);   // one batch since the last check
                 CheckForShutdown(3);
                 if (pblock->nNonce == 0)
                     break;

@@ -20,6 +20,19 @@ bool               fWalletRpc     = false;  // /walletrpc -- off unless asked fo
 string             strWalletRpcBind = "127.0.0.1";  // /walletrpcbind=ADDR
 void ThreadWalletRPC(void*);                // walletrpc.cpp
 
+// Poll the stall detector. Separate from the status line so the check runs on a
+// tighter cadence than the 60s status output, and keeps running if status is off.
+static void ThreadStallWatch(void*)
+{
+    while (!fShutdown)
+    {
+        try { StallWatchUpdate(); }
+        catch (...) { }
+        for (int i = 0; i < 30 && !fShutdown; i++)
+            Sleep(1000);
+    }
+}
+
 static bool arg(int argc, char* argv[], const char* key)
 {
     for (int i=1;i<argc;i++) { string s=argv[i]; if(s==key||s.substr(0,s.find('='))==key) return true; }
@@ -69,6 +82,7 @@ static void PrintUsage()
     printf("  /announcerelay=HOST:PORT\n");
     printf("\n");
     printf("Wallet GUI:\n");
+    printf("  /stallwarn=SECS            (warn if the tip stops advancing; default 1200, 0 off)\n");
     printf("  /walletrpc                 (serve the wallet UI on 127.0.0.1)\n");
     printf("  /walletrpcport=N           (default 8901)\n");
     printf("  /walletrpcbind=ADDR        (default 127.0.0.1; use 0.0.0.0 in Docker\n");
@@ -90,15 +104,11 @@ static void ParseStartupArguments(int argc, char* argv[])
         fDebug = true;
 
     if (arg(argc,argv,"/gen") || arg(argc,argv,"-gen"))
-    {
-        fGenerateBitcoins = 1;
-        // Mining mode defaults to MINE_RELAY, and nothing in this parser ever
-        // changed it, so BitcoinMiner() returned immediately at its relay guard
-        // and /gen mined nothing at all. /operator and /participant still set
-        // their own mode below, so only the unqualified case is affected.
-        if (nMineMode == MINE_RELAY)
-            nMineMode = MINE_SOLO;
-    }
+        fGenerateBitcoins = 1; if (nMineMode == MINE_RELAY) nMineMode = MINE_SOLO;
+
+    string strStall = argval2(argc, argv, "/stallwarn", "-stallwarn");
+    if (!strStall.empty())
+        nStallWarnSecs = atoi64(strStall.c_str());
 
     if (arg(argc,argv,"/walletrpc") || arg(argc,argv,"-walletrpc"))
         fWalletRpc = true;
@@ -145,7 +155,7 @@ static void ParseStartupArguments(int argc, char* argv[])
 
     // /connectbtf=ADDRESS, repeatable -- scan every argument rather than using
     // argval2(), which returns only the first match. /btfseed below already
-    // works this way; this did not, so a second /connectbtf was discarded.
+    // works this way; this did not, so a second /connectbtf was ignored.
     for (int i = 1; i < argc; i++)
     {
         string s = argv[i];
@@ -207,17 +217,12 @@ static void ParseStartupArguments(int argc, char* argv[])
 }
 
 
-// Headless status line.
-//
-// GetBalance() had exactly one caller, the ImGui GUI, so a headless node could
-// mine indefinitely with no way to report what it had earned. The found-block
-// message in BitcoinMiner() sits behind the "net" log category, which is off
-// unless /debug is passed, so a solo miner that found a block printed nothing
-// whatsoever.
-//
-// Mined coins are coinbase outputs and CWalletTx::GetCredit() deliberately
-// values immature coinbase at 0, so mature and immature are reported apart
-// rather than summed into one misleading number.
+// Headless status line. The GUI was the only thing that ever called
+// GetBalance(), so a headless node could mine indefinitely with no way to
+// report what it had earned -- and found blocks only print under /debug.
+// Mined coins are coinbase outputs: CWalletTx::GetCredit() deliberately
+// returns 0 until COINBASE_MATURITY (100 blocks) has passed, so mature and
+// immature are counted separately here rather than summed into one number.
 static void PrintStatusLine()
 {
     int64 nMature   = GetBalance();
@@ -261,12 +266,16 @@ static void PrintStatusLine()
            nMinedTotal - nMinedOrphaned, nMinedOrphaned,
            FormatMoney(nMature).c_str(),
            FormatMoney(nImmature).c_str(), nMinedImmature);
-    // Only the GUI ever displayed this, so a headless operator had no way to
-    // learn the address other nodes must dial to reach them -- which makes
-    // deliberate peering with a known node impossible.
+    // Only the GUI ever showed this, so a headless operator had no way to learn
+    // the address other nodes must dial to reach them -- which makes deliberate
+    // peering with known nodes impossible. Printed once per status tick.
     printf("STATUS btf=%s\n", BtfLocalAddress().c_str());
     if (fGenerateBitcoins)
         printf("STATUS hashrate=%.0f H/s\n", HashMeterRate());
+    int64 nStalled = StallSeconds();
+    if (nStalled > 0)
+        printf("STATUS STALLED for %lld s -- tip not advancing; mining is probably "
+               "wasted\n", (long long)nStalled);
     fflush(stdout);
 }
 
@@ -326,6 +335,9 @@ int main(int argc, char* argv[])
 
     if (!StartNode(strErrors)) { fprintf(stderr,"StartNode: %s\n",strErrors.c_str()); return 1; }
 
+    if (_beginthread(ThreadStallWatch, 0, NULL) == (uintptr_t)-1)
+        printf("Error: _beginthread(ThreadStallWatch) failed\n");
+
     if (fWalletRpc)
         if (_beginthread(ThreadWalletRPC, 0, NULL) == (uintptr_t)-1)
             printf("Error: _beginthread(ThreadWalletRPC) failed\n");
@@ -338,11 +350,9 @@ int main(int argc, char* argv[])
     }
     if (fGenerateBitcoins)
     {
-        // One miner thread per core -- the todo in net.cpp above
-        // ThreadBitcoinMiner. Override with BITFLASH_MINERS=N.
-        //
-        // Participant mode stays single-threaded on purpose: each thread would
-        // open its own pool connection and submit shares independently.
+        // One miner thread per core (Satoshi's TODO in net.cpp, finally done).
+        // Override with BITFLASH_MINERS=N. Pool participant mode stays single-
+        // threaded: each of its threads would open its own pool connection.
         int nMiners = 1;
         if (nMineMode == MINE_SOLO)
         {
@@ -354,10 +364,9 @@ int main(int argc, char* argv[])
                 unsigned int n = std::thread::hardware_concurrency();
                 nMiners = n > 0 ? (int)n : 1;
             }
-            // Build the ~2 GB dataset once, before any miner thread exists.
-            // RandomXInitDataset() is not thread-safe and guards only on the
-            // g_fFast flag it sets at the end, so N threads reaching it together
-            // would each allocate their own 2 GB dataset.
+            // Build the ~2 GB RandomX dataset once, BEFORE the miner threads
+            // exist: RandomXInitDataset is not thread-safe, and N threads
+            // racing it would each allocate their own 2 GB dataset.
             RandomXInitDataset(nMiners);
         }
         printf("Starting %d miner thread(s)\n", nMiners);

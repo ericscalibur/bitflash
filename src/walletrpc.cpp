@@ -98,6 +98,7 @@ background:#252a34;color:var(--mut)}
 </style></head><body><div class="wrap">
 <h1>Bitflash Wallet</h1>
 <div class="sub" id="sub">connecting…</div>
+<div class="msg" id="stall"></div>
 
 <div class="card">
   <div class="mut" style="font-size:12.5px">Spendable</div>
@@ -162,6 +163,12 @@ async function refresh(){
     document.getElementById("imm").textContent=f(i.maturing)+" BTF";
     document.getElementById("mined").textContent=i.blocks_mined;
     document.getElementById("hr").textContent=i.mining?hr(i.hashrate):"off";
+    const st=document.getElementById("stall");
+    if(i.stalled_secs>0){st.className="msg e";
+      st.textContent="Node stalled: the chain tip has not advanced for "
+        +Math.floor(i.stalled_secs/60)+" min while "+i.peers
+        +" peers are connected. Blocks mined now will most likely be orphaned. Restart the node.";}
+    else{st.className="msg";st.textContent=""}
     const oe=document.getElementById("orph");
     oe.textContent=i.blocks_orphaned+(i.blocks_orphaned?" ("+f(i.orphaned)+")":"");
     oe.className=i.blocks_orphaned>0?"bad":"mut";
@@ -276,11 +283,13 @@ struct WalletSnapshot
     bool   fMining;
     double dHashrate;
     string strBtf, strBestHash;
+    int64  nStalled;
     json   jTxs;
 
     WalletSnapshot() : fReady(false), nAt(0), nMature(0), nImmature(0),
         nOrphaned(0), nMined(0), nMinedImm(0), nMinedOrph(0), nHeight(0),
-        nPeers(0), fMining(false), dHashrate(0.0), jTxs(json::array()) {}
+        nPeers(0), fMining(false), dHashrate(0.0), nStalled(0),
+        jTxs(json::array()) {}
 };
 
 static WalletSnapshot   g_snap;
@@ -414,6 +423,7 @@ static bool BuildSnapshot()
     s.fMining   = fGenerateBitcoins ? true : false;
     s.dHashrate = HashMeterRate();
     s.strBtf    = BtfLocalAddress();
+    s.nStalled  = StallSeconds();
     s.nAt       = GetTime();
     s.fReady    = true;
 
@@ -517,6 +527,7 @@ static json RpcGetInfo()
     j["hashrate"]        = s.dHashrate;
     j["btf_address"]     = s.strBtf;
     j["best_hash"]       = s.strBestHash;
+    j["stalled_secs"]    = s.nStalled;   // 0 = healthy; >0 = tip not advancing
     return j;
 }
 

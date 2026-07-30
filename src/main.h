@@ -136,7 +136,10 @@ bool CreateTransaction(CScript scriptPubKey, int64 nValue, CWalletTx& txNew, int
 bool CommitTransactionSpent(const CWalletTx& wtxNew);
 bool SendMoney(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew);
 void   HashMeterAdd(int nHashes);   // main.cpp -- called by miner threads
-double HashMeterRate();             // observed hashes/sec over a 15s window
+int64  StallWatchUpdate();          // main.cpp -- call periodically; secs stalled or 0
+int64  StallSeconds();              // 0 when healthy
+extern int64 nStallWarnSecs;        // /stallwarn=SECS, 0 disables
+double HashMeterRate();             // observed hashes/sec, 15s window
 
 
 
