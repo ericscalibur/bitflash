@@ -3003,11 +3003,14 @@ bool BitcoinMiner()
                 break;
             }
 
-            // Check stop conditions periodically (RandomX is slow, so every
-            // ~256 hashes is already plenty of time)
-            if ((++pblock->nNonce & 0xff) == 0)
+            // Check stop conditions every 32 hashes, not 256: between a new
+            // block arriving and this check noticing it, the thread is hashing
+            // a template whose parent is already stale, and any block it finds
+            // in that window is born orphaned. At a few hundred H/s per thread
+            // 256 hashes is most of a second of that, per thread.
+            if ((++pblock->nNonce & 0x1f) == 0)
             {
-                HashMeterAdd(256);   // one batch since the previous check
+                HashMeterAdd(32);    // one batch since the previous check
                 CheckForShutdown(3);
                 if (pblock->nNonce == 0)
                     break;
