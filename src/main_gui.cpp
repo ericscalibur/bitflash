@@ -14,6 +14,10 @@ int RunGUI(int argc, char* argv[]);
 // Global definitions (were in ui.cpp, now here)
 map<string,string> mapAddressBook;
 bool               gPoolServerRunning = false;
+int                nWalletRpcPort = 8901;   // /walletrpcport=N
+bool               fWalletRpc     = false;  // /walletrpc -- off unless asked for
+string             strWalletRpcBind = "127.0.0.1";  // /walletrpcbind=ADDR
+void ThreadWalletRPC(void*);                // walletrpc.cpp
 
 static bool arg(int argc, char* argv[], const char* key)
 {
@@ -63,6 +67,12 @@ static void PrintUsage()
     printf("  /rvrelay=HOST:PORT\n");
     printf("  /announcerelay=HOST:PORT\n");
     printf("\n");
+    printf("Wallet GUI:\n");
+    printf("  /walletrpc                 (serve the wallet UI on 127.0.0.1)\n");
+    printf("  /walletrpcport=N           (default 8901)\n");
+    printf("  /walletrpcbind=ADDR        (default 127.0.0.1; use 0.0.0.0 in Docker\n");
+    printf("                              with -p 127.0.0.1:8901:8901)\n");
+    printf("\n");
     printf("Network:\n");
     printf("  /port=N                    (P2P listen port, default 8433)\n");
     printf("  /btfseed=ADDRESS:ENCHEX    (extra bootstrap peer, repeatable)\n");
@@ -80,6 +90,23 @@ static void ParseStartupArguments(int argc, char* argv[])
 
     if (arg(argc,argv,"/gen") || arg(argc,argv,"-gen"))
         fGenerateBitcoins = 1;
+
+    if (arg(argc,argv,"/walletrpc") || arg(argc,argv,"-walletrpc"))
+        fWalletRpc = true;
+
+    string strWBind = argval2(argc, argv, "/walletrpcbind", "-walletrpcbind");
+    if (!strWBind.empty())
+        strWalletRpcBind = strWBind;
+
+    string strWrpc = argval2(argc, argv, "/walletrpcport", "-walletrpcport");
+    if (!strWrpc.empty())
+    {
+        int n = atoi(strWrpc.c_str());
+        if (n <= 0 || n > 65535)
+            fprintf(stderr, "Ignoring /walletrpcport=%s: not a port number\n", strWrpc.c_str());
+        else
+            nWalletRpcPort = n;
+    }
 
     if (arg(argc,argv,"/solomine") || arg(argc,argv,"-solomine"))
         fSoloMineTest = true;
@@ -264,6 +291,10 @@ int main(int argc, char* argv[])
     ReacceptWalletTransactions();
 
     if (!StartNode(strErrors)) { fprintf(stderr,"StartNode: %s\n",strErrors.c_str()); return 1; }
+
+    if (fWalletRpc)
+        if (_beginthread(ThreadWalletRPC, 0, NULL) == (uintptr_t)-1)
+            printf("Error: _beginthread(ThreadWalletRPC) failed\n");
 
     if (nMineMode == MINE_OPERATOR) {
         gPoolServerRunning = true;
