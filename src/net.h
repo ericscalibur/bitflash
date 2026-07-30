@@ -791,6 +791,35 @@ inline void RelayInventory(const CInv& inv)
             pnode->PushInventory(inv);
 }
 
+// Push a full block to every peer not already known to have it.
+//
+// The default path announces a block with inv and waits for getdata, so each
+// hop costs three message legs -- inv, getdata, block -- and every leg is gated
+// by the 100ms ThreadMessageHandler tick AND a rendezvous-relay round trip,
+// since no peer is dialled by IP any more. Slow propagation is exactly what
+// orphans blocks: a block that arrives second loses a race it had already won.
+// Blocks on this chain average ~300 bytes, so sending the block outright costs
+// about what announcing it does and removes two legs of the three.
+//
+// Unsolicited blocks need no protocol change: ProcessMessage's "block" handler
+// never checks that a block was requested, and a duplicate is discarded by
+// ProcessBlock. Peers on older builds accept these normally.
+template<typename T>
+inline void RelayBlockDirect(const CInv& inv, const T& block)
+{
+    CRITICAL_BLOCK(cs_vNodes)
+        foreach(CNode* pnode, vNodes)
+        {
+            bool fHas = false;
+            CRITICAL_BLOCK(pnode->cs_inventory)
+                fHas = pnode->setInventoryKnown.count(inv) > 0;
+            if (fHas)
+                continue;   // includes whoever just sent it to us
+            pnode->PushMessage("block", block);
+            pnode->AddInventoryKnown(inv);
+        }
+}
+
 template<typename T>
 void RelayMessage(const CInv& inv, const T& a)
 {

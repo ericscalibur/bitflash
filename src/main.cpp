@@ -1330,7 +1330,15 @@ bool CBlock::AcceptBlock()
         return error("AcceptBlock() : AddToBlockIndex failed");
 
     if (hashBestChain == hash)
-        RelayInventory(CInv(MSG_BLOCK, hash));
+    {
+        // Propagate the block itself instead of announcing it; see
+        // RelayBlockDirect in net.h. Falls back to the inv path if a block is
+        // ever large enough that pushing it to every peer would be wasteful.
+        if (::GetSerializeSize(*this, SER_NETWORK) <= 32000)
+            RelayBlockDirect(CInv(MSG_BLOCK, hash), *this);
+        else
+            RelayInventory(CInv(MSG_BLOCK, hash));
+    }
 
     // // Add atoms to user reviews for coins created
     // vector<unsigned char> vchPubKey;
