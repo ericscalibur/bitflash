@@ -157,6 +157,7 @@ function ago(t){if(!t)return"–";const s=Math.floor(Date.now()/1000)-t;
 async function refresh(){
   try{
     const i=await api("getinfo");
+    if(!i.ready){document.getElementById("sub").textContent="node starting, building first snapshot…";return}
     document.getElementById("bal").textContent=f(i.spendable);
     document.getElementById("imm").textContent=f(i.maturing)+" BTF";
     document.getElementById("mined").textContent=i.blocks_mined;
@@ -167,7 +168,8 @@ async function refresh(){
     document.getElementById("h").textContent=i.height;
     document.getElementById("p").textContent=i.peers;
     document.getElementById("sub").textContent=
-      (i.mining?"mining "+hr(i.hashrate)+" · ":"")+i.peers+" peers · height "+i.height;
+      (i.mining?"mining "+hr(i.hashrate)+" · ":"")+i.peers+" peers · height "+i.height
+      +(i.age>30?" · data "+i.age+"s old":"");
     document.body.classList.remove("off");
     const t=await api("listtransactions");
     const tb=document.getElementById("tb");
@@ -246,14 +248,70 @@ static void MakeToken()
     }
 }
 
+// ---------------------------------------------------------------- snapshot
+//
+// getinfo and listtransactions used to compute their answers inline, which meant
+// acquiring cs_mapWallet, cs_vNodes, cs_hashmeter and cs_nostrKey on the request
+// path. That is a latent deadlock and it fired: one request blocked on a lock
+// another thread held, every subsequent request queued behind it, and because
+// each connection has its own thread the process accumulated ~200 stuck threads.
+// Worse, the lock it held was one the networking threads need, so the node
+// stopped processing incoming blocks and mined a doomed private branch for three
+// hours.
+//
+// So the read path now takes no node locks at all. A single refresher thread
+// builds a snapshot on its own schedule and requests serve the last good copy.
+// The refresher uses TRY locks throughout: if anything is busy it skips the
+// cycle and leaves the previous snapshot in place, so a wedge anywhere in the
+// node degrades this to stale data instead of propagating into a deadlock.
+// Responses carry `age`, so the UI can say the data is stale rather than imply
+// it is current.
+struct WalletSnapshot
+{
+    bool   fReady;
+    int64  nAt;                       // GetTime() when built
+    int64  nMature, nImmature, nOrphaned;
+    int    nMined, nMinedImm, nMinedOrph;
+    int    nHeight, nPeers;
+    bool   fMining;
+    double dHashrate;
+    string strBtf, strBestHash;
+    json   jTxs;
+
+    WalletSnapshot() : fReady(false), nAt(0), nMature(0), nImmature(0),
+        nOrphaned(0), nMined(0), nMinedImm(0), nMinedOrph(0), nHeight(0),
+        nPeers(0), fMining(false), dHashrate(0.0), jTxs(json::array()) {}
+};
+
+static WalletSnapshot   g_snap;
+static CCriticalSection cs_snap;   // guards g_snap ONLY; held for a copy
+static const int SNAPSHOT_SECS = 5;
+
+// Bound on connections being handled at once. With a thread per connection and
+// no bound, a handler that blocks for any reason strands a thread per request
+// and the process grows without limit -- ~200 threads, in the incident this
+// replaced. Past the cap we answer 503 immediately instead of queueing.
+//
+// The cap and the socket timeout have to be chosen together. Browsers open
+// speculative preconnect sockets that send nothing, and each one occupies a slot
+// until its read times out; with a 10s timeout and a cap of 24, thirty
+// preconnects starved every real request. Hence a 3s timeout: a loopback client
+// sends its request in microseconds, so 3s is already generous, and a silent
+// socket now vacates its slot quickly enough not to matter.
+static CCriticalSection cs_conns;
+static int g_nConns = 0;
+static const int MAX_CONNS = 64;
+
+static string FormatAmount(int64 n);   // defined below
+
 // Is this wallet transaction's block on the main chain?
 //   1 = yes,  0 = block is known but NOT on the main chain (orphaned/stale),
 //  -1 = no block recorded yet, so we cannot tell.
 //
-// mapBlockIndex is read without holding cs_main, matching what
-// CMerkleTx::GetDepthInMainChain() beside it already does. Locking in one of
-// the two and not the other would introduce an inconsistent order rather than
-// remove a race.
+// Callers must hold cs_main: mapBlockIndex is mutated by block processing, and
+// reading a std::map while another thread rebalances it can spin or crash.
+// CMerkleTx::GetDepthInMainChain() reads it unlocked, which is a bug there too,
+// but inheriting it is not a defence.
 static int WalletTxChainStatus(const CWalletTx* p)
 {
     if (p->hashBlock == 0 || p->nIndex == -1)
@@ -264,45 +322,117 @@ static int WalletTxChainStatus(const CWalletTx* p)
     return (*mi).second->IsInMainChain() ? 1 : 0;
 }
 
-// Wallet snapshot, splitting mined coins three ways.
-//
-// Mature and immature are reported apart because CWalletTx::GetCredit()
-// deliberately values immature coinbase at 0. Orphaned coinbase has to be
-// separated too, and that is easy to get wrong: an orphaned block has
-// GetDepthInMainChain() == 0, so GetBlocksToMaturity() returns the full
-// COINBASE_MATURITY and the coins look like they are merely "maturing" -- and
-// keep looking that way forever, because the depth never grows. Counting them
-// as pending income overstates the balance permanently. They are counted here
-// only if the block is genuinely absent from the main chain, which is a
-// different question from how deep it is.
-static void WalletTotals(int64& nMature, int64& nImmature, int64& nOrphaned,
-                         int& nMined, int& nMinedImmature, int& nMinedOrphaned)
+// Build a fresh snapshot. Returns false if the node was too busy, in which case
+// the caller keeps the previous one. Lock order is cs_main -> cs_mapWallet,
+// matching ProcessBlock -> AddToWalletIfInvolvingMe; TRY throughout means a
+// wrong order elsewhere still cannot deadlock us.
+static bool BuildSnapshot()
 {
-    nMature = GetBalance();
-    nImmature = 0; nOrphaned = 0;
-    nMined = 0; nMinedImmature = 0; nMinedOrphaned = 0;
-    CRITICAL_BLOCK(cs_mapWallet)
+    WalletSnapshot s;
+    bool fGot = false;
+
+    TRY_CRITICAL_BLOCK(cs_main)
+    TRY_CRITICAL_BLOCK(cs_mapWallet)
     {
+        fGot = true;
+        s.nHeight    = nBestHeight;
+        s.strBestHash = hashBestChain.GetHex();
+
+        struct Row { unsigned int t; string txid, type; int64 amt; int conf;
+                     bool imm, orph; };
+        vector<Row> rows;
+
         for (map<uint256, CWalletTx>::iterator it = mapWallet.begin();
              it != mapWallet.end(); ++it)
         {
             CWalletTx* p = &(*it).second;
-            if (!p->IsCoinBase())
-                continue;
-            nMined++;
-            if (WalletTxChainStatus(p) == 0)
+
+            // Mature balance, matching GetBalance(): CWalletTx::GetCredit()
+            // already values immature coinbase at 0, and an orphaned coinbase
+            // has depth 0 so it reports immature too -- neither can inflate this.
+            if (p->IsFinal() && !p->fSpent)
+                s.nMature += p->GetCredit();
+
+            bool fOrph = false;
+            if (p->IsCoinBase())
             {
-                nMinedOrphaned++;
-                nOrphaned += p->CTransaction::GetCredit();
+                s.nMined++;
+                fOrph = (WalletTxChainStatus(p) == 0);
+                if (fOrph)
+                {
+                    s.nMinedOrph++;
+                    s.nOrphaned += p->CTransaction::GetCredit();
+                }
+                else if (p->GetBlocksToMaturity() > 0)
+                {
+                    s.nMinedImm++;
+                    s.nImmature += p->CTransaction::GetCredit();
+                }
             }
-            else if (p->GetBlocksToMaturity() > 0)
-            {
-                nMinedImmature++;
-                nImmature += p->CTransaction::GetCredit();
-            }
+
+            Row r;
+            r.txid = p->GetHash().GetHex();
+            r.t    = p->nTimeReceived;
+            r.conf = p->GetDepthInMainChain();
+            r.orph = fOrph;
+            r.imm  = p->IsCoinBase() && !fOrph && p->GetBlocksToMaturity() > 0;
+            int64 nCredit = p->CTransaction::GetCredit();
+            int64 nDebit  = p->GetDebit();
+            if (p->IsCoinBase())    { r.type = "mined";    r.amt = nCredit; }
+            else if (nDebit > 0)    { r.type = "sent";     r.amt = nCredit - nDebit; }
+            else                    { r.type = "received"; r.amt = nCredit; }
+            rows.push_back(r);
+        }
+
+        for (unsigned int i = 0; i < rows.size(); i++)
+            for (unsigned int k = i + 1; k < rows.size(); k++)
+                if (rows[k].t > rows[i].t)
+                    swap(rows[i], rows[k]);
+
+        s.jTxs = json::array();
+        for (unsigned int i = 0; i < rows.size() && i < 100; i++)
+        {
+            json o;
+            o["txid"]          = rows[i].txid;
+            o["type"]          = rows[i].type;
+            o["amount"]        = FormatAmount(rows[i].amt);
+            o["confirmations"] = rows[i].conf;
+            o["time"]          = (int64)rows[i].t;
+            o["maturing"]      = rows[i].imm;
+            o["orphaned"]      = rows[i].orph;
+            s.jTxs.push_back(o);
         }
     }
+    if (!fGot)
+        return false;
+
+    // Best-effort extras. A failure here leaves the field at its previous value
+    // rather than discarding an otherwise good snapshot.
+    TRY_CRITICAL_BLOCK(cs_vNodes)
+        s.nPeers = (int)vNodes.size();
+
+    s.fMining   = fGenerateBitcoins ? true : false;
+    s.dHashrate = HashMeterRate();
+    s.strBtf    = BtfLocalAddress();
+    s.nAt       = GetTime();
+    s.fReady    = true;
+
+    CRITICAL_BLOCK(cs_snap)
+        g_snap = s;
+    return true;
 }
+
+void ThreadWalletSnapshot(void*)
+{
+    while (!fShutdown)
+    {
+        try { BuildSnapshot(); }
+        catch (...) { }   // never let the refresher die; stale beats absent
+        for (int i = 0; i < SNAPSHOT_SECS && !fShutdown; i++)
+            Sleep(1000);
+    }
+}
+
 
 static string FormatAmount(int64 n)
 {
@@ -360,27 +490,36 @@ static bool ParseAmount(const string& strIn, int64& nRet)
 
 static json RpcGetInfo()
 {
-    int64 nMature, nImmature, nOrphaned; int nMined, nMinedImm, nMinedOrph;
-    WalletTotals(nMature, nImmature, nOrphaned, nMined, nMinedImm, nMinedOrph);
-    int nPeers = 0;
-    CRITICAL_BLOCK(cs_vNodes)
-        nPeers = (int)vNodes.size();
+    WalletSnapshot s;
+    CRITICAL_BLOCK(cs_snap)
+        s = g_snap;
+
     json j;
-    j["spendable"]    = FormatAmount(nMature);
-    j["maturing"]     = FormatAmount(nImmature);
-    j["blocks_mined"]    = nMined;                 // every block we ever found
-    j["blocks_accepted"] = nMined - nMinedOrph;    // ...that the chain kept
-    j["blocks_orphaned"] = nMinedOrph;             // ...that it did not
-    j["orphaned"]        = FormatAmount(nOrphaned);
-    j["maturing_blocks"] = nMinedImm;
-    j["height"]       = nBestHeight;
-    j["peers"]        = nPeers;
-    j["mining"]       = fGenerateBitcoins ? true : false;
-    j["btf_address"]  = BtfLocalAddress();
-    j["hashrate"]     = HashMeterRate();          // H/s, 0 until the window fills
-    j["best_hash"]    = hashBestChain.GetHex();   // tip hash, for fork detection
+    if (!s.fReady)
+    {
+        // First few seconds after startup, before the refresher has run once.
+        j["ready"] = false;
+        j["age"]   = -1;
+        return j;
+    }
+    j["ready"]           = true;
+    j["age"]             = (int64)(GetTime() - s.nAt);   // seconds; UI shows staleness
+    j["spendable"]       = FormatAmount(s.nMature);
+    j["maturing"]        = FormatAmount(s.nImmature);
+    j["orphaned"]        = FormatAmount(s.nOrphaned);
+    j["blocks_mined"]    = s.nMined;
+    j["blocks_accepted"] = s.nMined - s.nMinedOrph;
+    j["blocks_orphaned"] = s.nMinedOrph;
+    j["maturing_blocks"] = s.nMinedImm;
+    j["height"]          = s.nHeight;
+    j["peers"]           = s.nPeers;
+    j["mining"]          = s.fMining;
+    j["hashrate"]        = s.dHashrate;
+    j["btf_address"]     = s.strBtf;
+    j["best_hash"]       = s.strBestHash;
     return j;
 }
+
 
 static json RpcGetNewAddress()
 {
@@ -391,50 +530,15 @@ static json RpcGetNewAddress()
 
 static json RpcListTransactions()
 {
-    struct Row { unsigned int t; string txid, type; int64 amt; int conf; bool imm, orph; };
-    vector<Row> rows;
-    CRITICAL_BLOCK(cs_mapWallet)
+    json j;
+    CRITICAL_BLOCK(cs_snap)
     {
-        for (map<uint256, CWalletTx>::iterator it = mapWallet.begin();
-             it != mapWallet.end(); ++it)
-        {
-            CWalletTx* p = &(*it).second;
-            Row r;
-            r.txid = p->GetHash().GetHex();
-            r.t    = p->nTimeReceived;
-            r.conf = p->GetDepthInMainChain();
-            r.orph = p->IsCoinBase() && WalletTxChainStatus(p) == 0;
-            r.imm  = p->IsCoinBase() && !r.orph && p->GetBlocksToMaturity() > 0;
-            int64 nCredit = p->CTransaction::GetCredit();
-            int64 nDebit  = p->GetDebit();
-            if (p->IsCoinBase())      { r.type = "mined";    r.amt = nCredit; }
-            else if (nDebit > 0)      { r.type = "sent";     r.amt = nCredit - nDebit; }
-            else                      { r.type = "received"; r.amt = nCredit; }
-            rows.push_back(r);
-        }
+        j["txs"] = g_snap.jTxs;
+        j["age"] = g_snap.fReady ? (int64)(GetTime() - g_snap.nAt) : (int64)-1;
     }
-    // newest first
-    for (unsigned int i = 0; i < rows.size(); i++)
-        for (unsigned int k = i + 1; k < rows.size(); k++)
-            if (rows[k].t > rows[i].t)
-                swap(rows[i], rows[k]);
-
-    json arr = json::array();
-    for (unsigned int i = 0; i < rows.size() && i < 100; i++)
-    {
-        json o;
-        o["txid"]          = rows[i].txid;
-        o["type"]          = rows[i].type;
-        o["amount"]        = FormatAmount(rows[i].amt);
-        o["confirmations"] = rows[i].conf;
-        o["time"]          = (int64)rows[i].t;
-        o["maturing"]      = rows[i].imm;
-        o["orphaned"]      = rows[i].orph;
-        arr.push_back(o);
-    }
-    json j; j["txs"] = arr;
     return j;
 }
+
 
 static json RpcSendToAddress(const json& in)
 {
@@ -454,8 +558,13 @@ static json RpcSendToAddress(const json& in)
     if (!ParseAmount(strAmt, nValue) || nValue <= 0)
         { j["error"] = "That is not a valid amount. Up to 8 decimal places."; return j; }
 
-    int64 nMature, nImmature, nOrphaned; int nMined, nMinedImm, nMinedOrph;
-    WalletTotals(nMature, nImmature, nOrphaned, nMined, nMinedImm, nMinedOrph);
+    // Deliberately live, not from the snapshot: spending decisions must not be
+    // made against data up to SNAPSHOT_SECS old. This is user-initiated and
+    // rare, so a blocking lock here cannot accumulate the way polling did.
+    int64 nMature = GetBalance();
+    int64 nImmature = 0;
+    CRITICAL_BLOCK(cs_snap)
+        nImmature = g_snap.nImmature;
     if (nValue > nMature)
     {
         // Worth distinguishing: "you have it but it is not mature yet" is a very
@@ -520,6 +629,7 @@ static const char* ReasonPhrase(int code)
     case 403: return "Forbidden";
     case 404: return "Not Found";
     case 405: return "Method Not Allowed";
+    case 503: return "Service Unavailable";
     default:  return "Error";
     }
 }
@@ -664,6 +774,8 @@ static void HandleConnectionThread(void* parg)
     try { HandleConnection(s); }
     catch (...) { }
     closesocket(s);
+    CRITICAL_BLOCK(cs_conns)
+        g_nConns--;
 }
 
 void ThreadWalletRPC(void*)
@@ -714,6 +826,9 @@ void ThreadWalletRPC(void*)
         return;
     }
 
+    if (_beginthread(ThreadWalletSnapshot, 0, NULL) == (uintptr_t)-1)
+        printf("walletrpc: could not start the snapshot thread\n");
+
     printf("Wallet GUI: http://%s:%d   (token in %s)\n",
            strWalletRpcBind.c_str(), nWalletRpcPort, TokenPath().c_str());
     if (!fLoopbackOnly)
@@ -749,14 +864,29 @@ void ThreadWalletRPC(void*)
         }
 
         struct timeval io;
-        io.tv_sec = 10; io.tv_usec = 0;
+        io.tv_sec = 3; io.tv_usec = 0;   // see the note on MAX_CONNS above
         setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&io, sizeof(io));
         setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&io, sizeof(io));
 
+        int nNow = 0;
+        CRITICAL_BLOCK(cs_conns)
+            nNow = g_nConns;
+        if (nNow >= MAX_CONNS)
+        {
+            // Shed load rather than queue it. Answering is cheap and tells the
+            // caller what happened; silently accumulating is what went wrong.
+            json j; j["error"] = "server busy";
+            RespondJson(s, 503, j);
+            closesocket(s);
+            continue;
+        }
+        CRITICAL_BLOCK(cs_conns)
+            g_nConns++;
         if (_beginthread(HandleConnectionThread, 0, new SOCKET(s)) == (uintptr_t)-1)
         {
-            // Could not spawn: drop this one rather than block the accept loop.
             printf("walletrpc: _beginthread failed, dropping connection\n");
+            CRITICAL_BLOCK(cs_conns)
+                g_nConns--;
             closesocket(s);
         }
     }
